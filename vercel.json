@@ -7,11 +7,11 @@
   "rewrites": [
     {
       "source": "/api/:match*",
-      "destination": "https://your-pos-api.onrender.com/api/:match*" 
+      "destination": "https://cfipos.onrender.com/api/:match*" 
     },
     {
       "source": "/socket.io/:match*",
-      "destination": "https://your-pos-api.onrender.com/socket.io/:match*"
+      "destination": "https://cfipos.onrender.com/socket.io/:match*"
     },
     {
       "source": "/(.*)",
