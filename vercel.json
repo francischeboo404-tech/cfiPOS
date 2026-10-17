@@ -7,7 +7,7 @@
   "rewrites": [
     {
       "source": "/api/:match*",
-      "destination": "https://your-pos-api.onrender.com/api/:match*"
+      "destination": "https://your-pos-api.onrender.com/api/:match*" 
     },
     {
       "source": "/socket.io/:match*",
