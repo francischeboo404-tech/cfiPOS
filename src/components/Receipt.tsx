@@ -12,6 +12,9 @@ import {
 import { LoyaltyPointsDisplay } from "./LoyaltyPointsDisplay";
 import { printerService } from "@/lib/hardware/escpos";
 import { resolveCompanyLogoUrl } from "@/hooks/useCompanyBranding";
+import { formatKesCents, parseKesToCents } from "@/lib/exactMoney";
+import { getEtimsReceiptNotice, isTestEtimsReceipt } from "@/lib/etimsReceipt";
+import { EtimsQrCode } from "@/components/EtimsQrCode";
 
 interface ReceiptProps {
   saleId: string;
@@ -21,28 +24,35 @@ interface ReceiptProps {
 interface Sale {
   id: string;
   created_at: string;
-  total_amount: number | string;
-  subtotal: number | string;
-  tax_amount: number | string;
+  total_amount: string;
+  subtotal: string;
+  tax_amount: string;
   payment_method: string;
   payment_status: string;
-  cash_amount: number | null;
-  mpesa_amount: number | null;
-  change_amount: number | null;
+  cash_amount: string | null;
+  mpesa_amount: string | null;
+  change_amount: string | null;
   mpesa_receipt_number: string | null;
   cashier_id: string;
   customer_id: string | null;
-  loyalty_discount: number | null;
+  loyalty_discount: string | null;
   loyalty_points_redeemed: number | null;
   loyalty_points_earned: number | null;
+  voucher_number: string | null;
+  voucher_points_redeemed: number;
+  voucher_points_earned: number;
+  voucher_balance_after: number | null;
+  voucher_expiry_date: string | null;
   etims_status?: string | null;
   etims_receipt_no?: string | null;
   etims_qr_code?: string | null;
   etims_signature?: string | null;
   sale_items: {
     quantity: number;
-    unit_price: number;
-    line_total: number;
+    unit_price: string;
+    line_total: string;
+    promotion_name?: string | null;
+    promotion_discount_per_unit_cents?: string | null;
     products: {
       name: string;
       sku: string;
@@ -63,10 +73,15 @@ interface MpesaTransaction {
   amount: number | string;
 }
 
+const formatMoney = (amount: string | number | null | undefined) =>
+  formatKesCents(parseKesToCents(String(amount ?? 0)));
+
 interface ServerSaleItem {
   quantity: number | string;
   unit_price: number | string;
   line_total: number | string;
+  promotion_name?: string | null;
+  promotion_discount_per_unit_cents?: string | null;
   product: { name: string; sku: string };
 }
 
@@ -82,6 +97,12 @@ interface ServerSale {
   mpesa_amount: number | string | null;
   change_amount: number | string | null;
   loyalty_discount: number | string | null;
+  voucher_id: string | null;
+  voucher_points_redeemed: string;
+  voucher_points_earned: string;
+  voucher_balance_after: string | null;
+  voucher_expiry_date: string | null;
+  voucher_number?: string | null;
   etims_status?: string | null;
   etims_receipt_no?: string | null;
   etims_qr_code?: string | null;
@@ -117,31 +138,40 @@ export function Receipt({ saleId, onClose }: ReceiptProps) {
         setSale({
           id: saleData.id,
           created_at: saleData.created_at,
-          total_amount: Number(saleData.total_amount),
-          subtotal: Number(saleData.subtotal),
-          tax_amount: Number(saleData.tax_amount),
+          total_amount: String(saleData.total_amount),
+          subtotal: String(saleData.subtotal),
+          tax_amount: String(saleData.tax_amount),
           payment_method: saleData.payment_method,
           payment_status: saleData.payment_status,
-          cash_amount: Number(saleData.cash_amount) || 0,
-          mpesa_amount: Number(saleData.mpesa_amount) || 0,
-          change_amount: Number(saleData.change_amount) || 0,
+          cash_amount: saleData.cash_amount === null ? null : String(saleData.cash_amount),
+          mpesa_amount: saleData.mpesa_amount === null ? null : String(saleData.mpesa_amount),
+          change_amount: saleData.change_amount === null ? null : String(saleData.change_amount),
           mpesa_receipt_number:
             response.mpesaTransaction?.mpesa_receipt_number || null,
           cashier_id: saleData.cashier.id,
           customer_id: saleData.customer?.id || null,
           loyalty_discount: saleData.loyalty_discount === null
             ? null
-            : Number(saleData.loyalty_discount),
+            : String(saleData.loyalty_discount),
           loyalty_points_redeemed: null,
           loyalty_points_earned: null,
+          voucher_number: saleData.voucher_number || null,
+          voucher_points_redeemed: Number(saleData.voucher_points_redeemed || 0),
+          voucher_points_earned: Number(saleData.voucher_points_earned || 0),
+          voucher_balance_after: saleData.voucher_balance_after === null
+            ? null
+            : Number(saleData.voucher_balance_after),
+          voucher_expiry_date: saleData.voucher_expiry_date || null,
           etims_status: saleData.etims_status || "not_applicable",
           etims_receipt_no: saleData.etims_receipt_no || null,
           etims_qr_code: saleData.etims_qr_code || null,
           etims_signature: saleData.etims_signature || null,
           sale_items: saleData.items.map((item) => ({
             quantity: Number(item.quantity),
-            unit_price: Number(item.unit_price),
-            line_total: Number(item.line_total),
+            unit_price: String(item.unit_price),
+            line_total: String(item.line_total),
+            promotion_name: item.promotion_name || null,
+            promotion_discount_per_unit_cents: item.promotion_discount_per_unit_cents || null,
             products: item.product,
           })),
           customers: saleData.customer,
@@ -155,7 +185,7 @@ export function Receipt({ saleId, onClose }: ReceiptProps) {
         if (response.mpesaTransaction) {
           setMpesaTransaction({
             ...response.mpesaTransaction,
-            amount: Number(response.mpesaTransaction.amount),
+            amount: String(response.mpesaTransaction.amount),
           });
         }
       }
@@ -195,10 +225,24 @@ export function Receipt({ saleId, onClose }: ReceiptProps) {
     lines.push("--------------------------------");
     sale.sale_items.forEach((item) => {
       lines.push(`${item.products.name}`);
-      lines.push(`${item.quantity} x ${item.unit_price} = ${item.line_total}`);
+      lines.push(`${item.quantity} x ${formatMoney(item.unit_price)} = ${formatMoney(item.line_total)}`);
+      if (item.promotion_name) {
+        lines.push(`Promotion: ${item.promotion_name}`);
+      }
     });
     lines.push("--------------------------------");
-    lines.push(`TOTAL: KSh ${sale.total_amount}`);
+    lines.push(`TOTAL: ${formatMoney(sale.total_amount)}`);
+    const etimsNotice = getEtimsReceiptNotice(sale.etims_status, sale.etims_receipt_no);
+    if (sale.etims_status === "submitted" && sale.etims_receipt_no) {
+      if (isTestEtimsReceipt(sale.etims_receipt_no)) {
+        lines.push(`Test eTIMS reference: ${sale.etims_receipt_no}`);
+      } else {
+        lines.push("eTIMS submission recorded - verification required");
+        lines.push(`Receipt reference: ${sale.etims_receipt_no}`);
+        if (sale.etims_signature) lines.push(`Sig: ${sale.etims_signature}`);
+      }
+    }
+    if (etimsNotice) lines.push(etimsNotice);
     lines.push("--------------------------------");
     lines.push(settings.receipt_footer || "Thank you!");
 
@@ -208,11 +252,16 @@ export function Receipt({ saleId, onClose }: ReceiptProps) {
 
   if (!sale) return null;
 
-  const cashAmount = sale.cash_amount || 0;
-  const mpesaAmount = sale.mpesa_amount || 0;
-  const changeAmount = sale.change_amount || 0;
+  const cashAmount = sale.cash_amount || "0";
+  const mpesaAmount = sale.mpesa_amount || "0";
+  const changeAmount = sale.change_amount || "0";
+  const cashAmountCents = parseKesToCents(cashAmount);
+  const mpesaAmountCents = parseKesToCents(mpesaAmount);
+  const changeAmountCents = parseKesToCents(changeAmount);
   const isHybridPayment =
-    sale.payment_method === "hybrid" || (cashAmount > 0 && mpesaAmount > 0);
+    sale.payment_method === "hybrid" || (cashAmountCents > 0 && mpesaAmountCents > 0);
+  const etimsNotice = getEtimsReceiptNotice(sale.etims_status, sale.etims_receipt_no);
+  const isTestFiscalReceipt = isTestEtimsReceipt(sale.etims_receipt_no);
 
   return (
     <Dialog open={true} onOpenChange={onClose}>
@@ -254,13 +303,14 @@ export function Receipt({ saleId, onClose }: ReceiptProps) {
             </h2>
             <p>{settings.company_address || "Nairobi, Kenya"}</p>
             <p>{settings.company_phone || "+254 700 000000"}</p>
-            <p>PIN: {settings.tax_pin || "P000000000A"}</p>
+            {settings.tax_pin && <p>PIN: {settings.tax_pin}</p>}
           </div>
 
-          {/* Prominent KRA Fiscal Compliance Disclaimer */}
-          <div className="my-2 border-2 border-dashed border-amber-500 bg-amber-50 p-2 text-center text-xs font-bold uppercase tracking-wider text-amber-900 dark:bg-amber-950 dark:text-amber-200">
-            *** TEST RECEIPT - NOT A VALID TAX INVOICE ***
-          </div>
+          {etimsNotice && (
+            <div className="my-2 border-2 border-dashed border-amber-500 bg-amber-50 p-2 text-center text-xs font-bold uppercase tracking-wider text-amber-900 dark:bg-amber-950 dark:text-amber-200">
+              {etimsNotice}
+            </div>
+          )}
 
           {/* Sale Info */}
           <div className="space-y-1">
@@ -299,18 +349,23 @@ export function Receipt({ saleId, onClose }: ReceiptProps) {
                 <div className="flex justify-between font-medium">
                   <span>{item.products.name}</span>
                   <span>
-                    KSh{" "}
-                    {item.line_total.toLocaleString("en-KE", {
-                      minimumFractionDigits: 2,
-                    })}
+                    {formatMoney(item.line_total)}
                   </span>
                 </div>
                 <div className="flex justify-between text-xs text-muted-foreground pl-2">
                   <span>
-                    {item.quantity} x KSh {item.unit_price.toFixed(2)}
+                    {item.quantity} x {formatMoney(item.unit_price)}
                   </span>
                   <span>SKU: {item.products.sku}</span>
                 </div>
+                {item.promotion_name && (
+                  <div className="pl-2 text-xs text-green-700">
+                    {item.promotion_name}
+                    {item.promotion_discount_per_unit_cents
+                      ? ` · saved ${formatKesCents(Number(item.promotion_discount_per_unit_cents))} per unit`
+                      : ""}
+                  </div>
+                )}
               </div>
             ))}
           </div>
@@ -320,42 +375,41 @@ export function Receipt({ saleId, onClose }: ReceiptProps) {
             <div className="flex justify-between">
               <span>Subtotal:</span>
               <span>
-                KSh{" "}
-                {sale.subtotal.toLocaleString("en-KE", {
-                  minimumFractionDigits: 2,
-                })}
+                {formatMoney(sale.subtotal)}
               </span>
             </div>
-            {(sale.loyalty_discount ?? 0) > 0 && (
+            {sale.loyalty_discount !== null && parseKesToCents(sale.loyalty_discount) > 0 && (
               <div className="flex justify-between text-green-600 dark:text-green-400">
-                <span>🎁 Loyalty Discount:</span>
+                <span>Discount:</span>
                 <span className="font-medium">
-                  -KSh{" "}
-                  {(sale.loyalty_discount ?? 0).toLocaleString("en-KE", {
-                    minimumFractionDigits: 2,
-                  })}
+                  -{formatMoney(sale.loyalty_discount)}
                 </span>
               </div>
+
             )}
             <div className="flex justify-between">
               <span>VAT (16%):</span>
               <span>
-                KSh{" "}
-                {sale.tax_amount.toLocaleString("en-KE", {
-                  minimumFractionDigits: 2,
-                })}
+                {formatMoney(sale.tax_amount)}
               </span>
             </div>
             <div className="flex justify-between font-bold text-lg border-t pt-2">
               <span>TOTAL:</span>
               <span>
-                KSh{" "}
-                {sale.total_amount.toLocaleString("en-KE", {
-                  minimumFractionDigits: 2,
-                })}
+                {formatMoney(sale.total_amount)}
               </span>
             </div>
           </div>
+
+          {sale.voucher_number && (
+            <div className="border-t pt-2 text-sm space-y-1">
+              <div>Voucher: {sale.voucher_number}</div>
+              <div>Points earned: {sale.voucher_points_earned}</div>
+              <div>Points redeemed: {sale.voucher_points_redeemed}</div>
+              <div>New balance: {sale.voucher_balance_after ?? "—"}</div>
+              <div>Valid until: {sale.voucher_expiry_date || "—"}</div>
+            </div>
+          )}
 
           {/* Payment Breakdown */}
           <div className="border-t border-b py-3 space-y-2 bg-muted/30 rounded px-2">
@@ -363,27 +417,21 @@ export function Receipt({ saleId, onClose }: ReceiptProps) {
               Payment Details
             </div>
 
-            {cashAmount > 0 && (
+            {cashAmountCents > 0 && (
               <div className="flex justify-between">
                 <span>💵 Cash Paid:</span>
                 <span className="font-medium">
-                  KSh{" "}
-                  {cashAmount.toLocaleString("en-KE", {
-                    minimumFractionDigits: 2,
-                  })}
+                  {formatMoney(cashAmount)}
                 </span>
               </div>
             )}
 
-            {mpesaAmount > 0 && (
+            {mpesaAmountCents > 0 && (
               <>
                 <div className="flex justify-between">
                   <span>📱 M-Pesa Paid:</span>
                   <span className="font-medium">
-                    KSh{" "}
-                    {mpesaAmount.toLocaleString("en-KE", {
-                      minimumFractionDigits: 2,
-                    })}
+                    {formatMoney(mpesaAmount)}
                   </span>
                 </div>
                 {mpesaTransaction?.mpesa_receipt_number && (
@@ -403,14 +451,11 @@ export function Receipt({ saleId, onClose }: ReceiptProps) {
               </>
             )}
 
-            {changeAmount > 0 && (
+            {changeAmountCents > 0 && (
               <div className="flex justify-between text-green-600 dark:text-green-400 font-medium border-t pt-1">
                 <span>Change Given:</span>
                 <span>
-                  KSh{" "}
-                  {changeAmount.toLocaleString("en-KE", {
-                    minimumFractionDigits: 2,
-                  })}
+                  {formatMoney(changeAmount)}
                 </span>
               </div>
             )}
@@ -457,52 +502,54 @@ export function Receipt({ saleId, onClose }: ReceiptProps) {
           <div className="border-t pt-3 text-center text-xs space-y-1">
             {sale.etims_status === "submitted" && sale.etims_receipt_no ? (
               <div className="space-y-1">
-                <div className="font-semibold text-primary">KRA eTIMS Fiscal Receipt</div>
-                <div className="font-mono text-[11px]">Invoice No: {sale.etims_receipt_no}</div>
+                <div className="font-semibold text-primary">
+                  {isTestFiscalReceipt
+                    ? "TEST eTIMS SIMULATION - NOT A TAX INVOICE"
+                    : "eTIMS Submission Recorded - Verification Required"}
+                </div>
+                <div className="font-mono text-[11px]">
+                  {isTestFiscalReceipt ? "Test reference" : "Receipt reference"}: {sale.etims_receipt_no}
+                </div>
                 {sale.etims_signature && (
                   <div className="font-mono text-[10px] text-muted-foreground break-all">
-                    Sig: {sale.etims_signature}
+                    {isTestFiscalReceipt ? "Test signature (simulation)" : "Sig"}: {sale.etims_signature}
                   </div>
                 )}
                 {sale.etims_qr_code && (
                   <div className="py-2 flex flex-col items-center justify-center">
-                    <img
-                      src={`https://api.qrserver.com/v1/create-qr-code/?size=110x110&data=${encodeURIComponent(sale.etims_qr_code)}`}
-                      alt="eTIMS Verification QR"
-                      className="w-24 h-24 mx-auto border p-1 rounded bg-white"
-                      loading="lazy"
+                    <EtimsQrCode
+                      value={sale.etims_qr_code}
+                      label={
+                        isTestFiscalReceipt
+                          ? "Test eTIMS QR code - not valid for KRA verification"
+                          : "eTIMS QR code - submission not independently verified"
+                      }
                     />
-                    <a
-                      href={sale.etims_qr_code}
-                      target="_blank"
-                      rel="noopener noreferrer"
-                      className="text-[10px] text-blue-600 underline mt-1 break-all"
-                    >
-                      Verify with KRA
-                    </a>
+                    {isTestFiscalReceipt && (
+                      <span className="text-[10px] text-muted-foreground mt-1">
+                        Test QR only - not valid for KRA verification
+                      </span>
+                    )}
                   </div>
                 )}
               </div>
             ) : sale.etims_status === "pending" ? (
               <div className="text-amber-600 dark:text-amber-400 font-medium py-1">
-                Fiscal receipt pending - receipt will be available shortly
+                Fiscal receipt pending - do not treat this as a KRA tax invoice
               </div>
             ) : sale.etims_status === "failed" ? (
               <div className="text-destructive font-medium py-1">
-                Fiscal submission pending verification
+                Fiscal receipt not confirmed - reconcile before treating as a tax invoice
               </div>
             ) : (
               <div className="text-muted-foreground italic py-1">
-                Non-fiscal receipt
+                CUSTOMER RECEIPT - NOT A KRA TAX INVOICE
               </div>
             )}
           </div>
 
           {/* Footer */}
           <div className="text-center text-xs border-t pt-4 space-y-1">
-            <p className="font-semibold text-amber-700 dark:text-amber-400">
-              *** TEST RECEIPT - NOT A VALID TAX INVOICE ***
-            </p>
             <p>{settings.receipt_footer || "Thank you for your business!"}</p>
             <p className="mt-2 text-muted-foreground">
               Powered by CFI-POS Techiez

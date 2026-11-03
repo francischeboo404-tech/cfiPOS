@@ -4,6 +4,7 @@ import { Product } from "../entity/Product";
 import { Sale, SaleStatus } from "../entity/Sale";
 import { InventoryService } from "../services/InventoryService";
 import { createInventoryPredictions } from "../services/InventoryPredictionService";
+import { centsToKesString, parseKesToCents } from "../lib/exactMoney";
 
 const getUtcDayStart = (date: Date) => new Date(Date.UTC(
     date.getUTCFullYear(),
@@ -32,18 +33,18 @@ export class InventoryPredictionController {
                 InventoryService.getTotalStockByProduct(AppDataSource.manager),
             ]);
 
-            const dailySales = new Map<string, { total: number; count: number }>();
+            const dailySales = new Map<string, { totalCents: bigint; count: number }>();
             for (let offset = 0; offset < 90; offset += 1) {
                 const date = new Date(start);
                 date.setUTCDate(date.getUTCDate() + offset);
-                dailySales.set(date.toISOString().slice(0, 10), { total: 0, count: 0 });
+                dailySales.set(date.toISOString().slice(0, 10), { totalCents: 0n, count: 0 });
             }
 
             for (const sale of sales) {
                 const date = new Date(sale.created_at).toISOString().slice(0, 10);
                 const day = dailySales.get(date);
                 if (!day) continue;
-                day.total += Number(sale.total_amount) || 0;
+                day.totalCents += parseKesToCents(String(sale.total_amount));
                 day.count += 1;
             }
 
@@ -56,7 +57,11 @@ export class InventoryPredictionController {
             }));
             const predictions = createInventoryPredictions(
                 inventory,
-                Array.from(dailySales, ([date, totals]) => ({ date, ...totals })),
+                Array.from(dailySales, ([date, totals]) => ({
+                    date,
+                    total: centsToKesString(totals.totalCents),
+                    count: totals.count,
+                })),
             );
 
             return res.json({

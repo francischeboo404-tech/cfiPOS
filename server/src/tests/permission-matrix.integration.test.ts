@@ -69,6 +69,7 @@ const PERMISSION_MATRIX: RouteSpec[] = [
     { method: "GET", path: "/api/sales", allowedRoles: ["cashier", "supervisor", "manager", "admin"] },
     { method: "POST", path: "/api/sales/checkouts", allowedRoles: ["cashier", "supervisor", "manager", "admin"], body: {} },
     { method: "GET", path: "/api/sales/checkouts/test-session-id", allowedRoles: ["cashier", "supervisor", "manager", "admin"] },
+    { method: "POST", path: "/api/sales/checkouts/test-session-id/confirm-cash", allowedRoles: ["cashier", "supervisor", "manager", "admin"], body: {} },
     { method: "POST", path: "/api/sales/checkouts/test-session-id/cancel", allowedRoles: ["cashier", "supervisor", "manager", "admin"], body: {} },
     { method: "POST", path: "/api/sales", allowedRoles: ["cashier", "supervisor", "manager", "admin"], body: {} },
     { method: "GET", path: "/api/store-credits/SC-TEST-BARCODE", allowedRoles: ["cashier", "supervisor", "manager", "admin"] },
@@ -111,6 +112,15 @@ const PERMISSION_MATRIX: RouteSpec[] = [
     { method: "GET", path: "/api/delivery-notes", allowedRoles: ["supervisor", "manager", "admin"] },
     { method: "GET", path: "/api/delivery-notes/00000000-0000-0000-0000-000000000001", allowedRoles: ["supervisor", "manager", "admin"] },
     { method: "GET", path: "/api/reports/summary", allowedRoles: ["supervisor", "manager", "admin"] },
+    { method: "GET", path: "/api/reports/costing", allowedRoles: ["manager", "admin"] },
+    { method: "GET", path: "/api/reports/costing/closes", allowedRoles: ["manager", "admin"] },
+    { method: "POST", path: "/api/reports/costing/closes", allowedRoles: ["manager", "admin"], body: { end_date: "invalid" } },
+    { method: "GET", path: "/api/admin/costing-baseline-verification", allowedRoles: ["admin"] },
+    { method: "POST", path: "/api/admin/costing-baseline-verification", allowedRoles: ["admin"], body: {} },
+    { method: "GET", path: "/api/admin/reports/payment-fees?start_date=2026-01-01&end_date=2026-01-01", allowedRoles: ["admin"] },
+    { method: "POST", path: "/api/admin/payment-fees", allowedRoles: ["admin"], body: {} },
+    { method: "GET", path: "/api/admin/payment-fees?start_date=2026-01-01&end_date=2026-01-01", allowedRoles: ["admin"] },
+    { method: "POST", path: "/api/admin/payment-fees/00000000-0000-0000-0000-000000000001/corrections", allowedRoles: ["admin"], body: {} },
     { method: "GET", path: "/api/inventory/movements", allowedRoles: ["supervisor", "manager", "admin"] },
     { method: "GET", path: "/api/loyalty/settings", allowedRoles: ["supervisor", "manager", "admin"] },
     { method: "GET", path: "/api/inventory/adjustments", allowedRoles: ["supervisor", "manager", "admin"] },
@@ -138,6 +148,7 @@ const PERMISSION_MATRIX: RouteSpec[] = [
     { method: "GET", path: "/api/vendors", allowedRoles: ["manager", "admin"] },
     { method: "GET", path: "/api/vendors/00000000-0000-0000-0000-000000000001", allowedRoles: ["manager", "admin"] },
     { method: "POST", path: "/api/vendors", allowedRoles: ["manager", "admin"], body: {} },
+    { method: "POST", path: "/api/vendors/00000000-0000-0000-0000-000000000001/review", allowedRoles: ["manager", "admin"], body: {} },
     { method: "PUT", path: "/api/vendors/00000000-0000-0000-0000-000000000001", allowedRoles: ["manager", "admin"], body: {} },
     { method: "GET", path: "/api/vendor-portal", allowedRoles: ["manager", "admin"] },
     { method: "GET", path: "/api/purchase-orders", allowedRoles: ["manager", "admin"] },
@@ -152,6 +163,7 @@ const PERMISSION_MATRIX: RouteSpec[] = [
     { method: "POST", path: "/api/procurement/invoices", allowedRoles: ["manager", "admin"], body: {} },
     { method: "POST", path: "/api/procurement/supplier-invoices", allowedRoles: ["manager", "admin"], body: {} },
     { method: "POST", path: "/api/procurement/supplier-invoices/00000000-0000-0000-0000-000000000001/payments", allowedRoles: ["manager", "admin"], body: {} },
+    { method: "POST", path: "/api/procurement/supplier-invoices/00000000-0000-0000-0000-000000000001/review", allowedRoles: ["manager", "admin"], body: {} },
     { method: "PUT", path: "/api/procurement/requisitions/00000000-0000-0000-0000-000000000001/status", allowedRoles: ["manager", "admin"], body: {} },
     { method: "POST", path: "/api/loyalty/members/00000000-0000-0000-0000-000000000001/points", allowedRoles: ["manager", "admin"], body: {} },
 
@@ -304,6 +316,41 @@ test("Phase 5 Permission Matrix: 401/403/2xx enforcement per role for all routes
                     }
                 }
             }
+        }
+
+        const adminToken = userTokens[AppRole.ADMIN];
+        const feeListResponse = await makeRequest(
+            "GET",
+            "/api/admin/reports/payment-fees?start_date=2026-01-01&end_date=2026-01-01",
+            adminToken,
+        );
+        assert.equal(feeListResponse.status, 200, "Admin fee report should load successfully");
+        const invalidFeeResponse = await makeRequest("POST", "/api/admin/payment-fees", adminToken, {});
+        assert.equal(invalidFeeResponse.status, 400, "Invalid fee data should be rejected with a validation response");
+        const summaryResponse = await makeRequest(
+            "GET",
+            "/api/reports/summary?start=2026-01-01&end=2026-01-02",
+            adminToken,
+        );
+        const summaryBody = await summaryResponse.text();
+        assert.equal(summaryResponse.status, 200, `Financial report handler should retain its controller context: ${summaryBody}`);
+
+        for (const role of [AppRole.ADMIN, AppRole.CASHIER]) {
+            const dashboardResponse = await makeRequest("GET", "/api/dashboard/stats", userTokens[role]);
+            assert.equal(dashboardResponse.status, 200, `Dashboard stats should load for ${role}`);
+            const dashboard = await dashboardResponse.json() as {
+                todaySalesCents: string;
+                recentTransactions: Array<{ amountCents: string }>;
+                salesByMethod: Array<{ amountCents: string }>;
+                weeklyTrend: Array<{ salesCents: string }>;
+                topProducts: Array<{ revenueCents: string }>;
+            };
+            const integerCents = /^-?\d+$/;
+            assert.match(dashboard.todaySalesCents, integerCents);
+            assert.ok(dashboard.recentTransactions.every((row) => integerCents.test(row.amountCents)));
+            assert.ok(dashboard.salesByMethod.every((row) => integerCents.test(row.amountCents)));
+            assert.ok(dashboard.weeklyTrend.every((row) => integerCents.test(row.salesCents)));
+            assert.ok(dashboard.topProducts.every((row) => integerCents.test(row.revenueCents)));
         }
 
         assert.ok(testedRoutes >= 70, `Matrix should test at least 70 routes (tested ${testedRoutes})`);

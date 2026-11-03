@@ -290,6 +290,10 @@ export default function Settings() {
       toast.error("The M-Pesa STK Till or Paybill number must contain 5 to 7 digits.");
       return;
     }
+    if (!stkNumber) {
+      toast.error(`Enter a valid 5–7 digit M-Pesa ${stkAccountType === "paybill" ? "Paybill" : "Till"} number for STK Push before saving.`);
+      return;
+    }
     if (settings.mpesa_paybill?.trim() && !/^\d{5,7}$/.test(settings.mpesa_paybill.trim())) {
       toast.error("The Paybill number must contain 5 to 7 digits.");
       return;
@@ -738,7 +742,10 @@ export default function Settings() {
                 disabled={role !== "admin"}
               />
               <p className="text-xs text-muted-foreground mt-1">
-                Must be the public HTTPS URL for this POS API endpoint. Localhost and private development URLs cannot receive Safaricom callbacks.
+                Must be a <strong>public HTTPS URL</strong> ending exactly in{" "}
+                <code>/api/webhooks/mpesa/callback</code>. Localhost and private
+                network URLs cannot receive Safaricom callbacks. Safaricom
+                requires port 443 (standard HTTPS).
               </p>
             </div>
             <div className="rounded-md border bg-muted/40 p-3 text-sm text-muted-foreground">
@@ -791,6 +798,68 @@ export default function Settings() {
             </CardDescription>
           </CardHeader>
           <CardContent className="space-y-4">
+            <div className="rounded-md border p-4 space-y-3">
+              <h3 className="font-semibold">Voucher card rules</h3>
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                <div>
+                  <Label htmlFor="voucher_points_per_100_kes">Points per KES 100 paid</Label>
+                  <Input
+                    id="voucher_points_per_100_kes"
+                    type="number"
+                    min="0"
+                    step="1"
+                    value={settings.voucher_points_per_100_kes ?? "1"}
+                    onChange={(event) => updateSetting(
+                      "voucher_points_per_100_kes",
+                      event.target.value,
+                    )}
+                    disabled={role !== "admin"}
+                  />
+                </div>
+                <div>
+                  <Label htmlFor="voucher_renewal_fee_cents">Renewal fee (KES cents)</Label>
+                  <Input
+                    id="voucher_renewal_fee_cents"
+                    type="number"
+                    min="0"
+                    step="1"
+                    value={settings.voucher_renewal_fee_cents ?? "0"}
+                    onChange={(event) => updateSetting(
+                      "voucher_renewal_fee_cents",
+                      event.target.value,
+                    )}
+                    disabled={role !== "admin"}
+                  />
+                </div>
+              </div>
+              <p className="text-xs text-muted-foreground">
+                Points are earned from the final amount paid and are never recalculated when this rate changes. One point redeems as KES 1.
+              </p>
+              <p className="text-xs text-muted-foreground">
+                Paid renewal fees are final VAT-inclusive amounts at Standard VAT 16%. Renewal expiry changes only after the full fee is confirmed as paid at checkout.
+              </p>
+            </div>
+            <div className="rounded-md border p-4 space-y-2">
+              <Label htmlFor="allow-negative-stock" className="font-semibold">
+                Allow admin-configured negative stock sales
+              </Label>
+              <label className="flex items-center gap-2 text-sm">
+                <input
+                  id="allow-negative-stock"
+                  type="checkbox"
+                  checked={settings.allow_negative_stock === "true"}
+                  onChange={(event) => updateSetting(
+                    "allow_negative_stock",
+                    String(event.target.checked),
+                  )}
+                  disabled={role !== "admin"}
+                />
+                Permit sales that take available stock below zero
+              </label>
+              <p className="text-xs text-muted-foreground">
+                Oversold quantities use the current warehouse average cost, or the product unit cost when warehouse stock is zero. Each override is recorded with the sale, user, time, and stock movement.
+              </p>
+            </div>
             <div className="grid grid-cols-2 gap-4">
               <div>
                 <Label htmlFor="loyalty_points_rate">Points Earned</Label>

@@ -4,6 +4,8 @@ import { Setting } from "../entity/Setting";
 import { LoyaltyMember } from "../entity/LoyaltyMember";
 import { Customer } from "../entity/Customer";
 import { normalizeProductUnitOfMeasures } from "../services/ProductCatalogSettings";
+import { VoucherService } from "../services/VoucherService";
+import { AuthenticatedRequest } from "../middleware/auth";
 
 const settingRepository = AppDataSource.getRepository(Setting);
 const loyaltyMemberRepository = AppDataSource.getRepository(LoyaltyMember);
@@ -35,6 +37,9 @@ const SETTINGS_KEYS = new Set([
     "loyalty_points_rate",
     "loyalty_points_per_amount",
     "loyalty_points_value",
+    "voucher_points_per_100_kes",
+    "voucher_renewal_fee_cents",
+    "allow_negative_stock",
     "loyalty_tier_silver_min",
     "loyalty_tier_gold_min",
     "loyalty_tier_platinum_min",
@@ -116,6 +121,44 @@ export const sanitizeSettingsPayload = (input: unknown) => {
                 throw new Error("M-Pesa STK account type must be Till or Paybill.");
             }
             sanitized[key] = value;
+            continue;
+        }
+
+        if (key === "mpesa_callback_url") {
+            const url = String(value).trim();
+            if (url) {
+                let parsed: URL;
+                try {
+                    parsed = new URL(url);
+                } catch {
+                    throw new Error("mpesa_callback_url must be a valid HTTPS URL ending in /api/webhooks/mpesa/callback");
+                }
+                const isLocal = ["localhost", "127.0.0.1", "::1"].includes(parsed.hostname) ||
+                    parsed.hostname.endsWith(".local") ||
+                    /^10\.|^172\.(1[6-9]|2\d|3[01])\.|^192\.168\./.test(parsed.hostname);
+                const pathOk = parsed.pathname.replace(/\/+$/, "").endsWith("/api/webhooks/mpesa/callback");
+                if (parsed.protocol !== "https:" || parsed.username || parsed.password || isLocal || !pathOk) {
+                    throw new Error("STK callback URL must be a public HTTPS URL ending in /api/webhooks/mpesa/callback");
+                }
+            }
+            sanitized[key] = url;
+            continue;
+        }
+
+        if (key === "voucher_points_per_100_kes" || key === "voucher_renewal_fee_cents") {
+            const integerValue = String(value).trim();
+            if (!/^\d{1,10}$/.test(integerValue)) {
+                throw new Error(`${key} must be a non-negative whole number.`);
+            }
+            sanitized[key] = integerValue;
+            continue;
+        }
+
+        if (key === "allow_negative_stock") {
+            if (value !== "true" && value !== "false" && value !== true && value !== false) {
+                throw new Error("allow_negative_stock must be true or false.");
+            }
+            sanitized[key] = String(value);
             continue;
         }
 
@@ -219,7 +262,7 @@ export class LoyaltyController {
             return res.json(buildSettingsMap(saved));
         } catch (error) {
             console.error("Error saving loyalty settings:", error);
-            if (error instanceof Error && /Product unit|Configure at least|Configure no more|Product units/.test(error.message)) {
+            if (error instanceof Error && /Product unit|Configure at least|Configure no more|Product units|Nonzero voucher renewal|allow_negative_stock|STK callback URL|mpesa_callback_url/.test(error.message)) {
                 return res.status(400).json({ message: error.message });
             }
             return res.status(500).json({ message: "Error saving loyalty settings" });
@@ -292,57 +335,42 @@ export class LoyaltyController {
 
     static async getMembers(req: Request, res: Response) {
         try {
-            const members = await loyaltyMemberRepository.find({
-                relations: ["customer"],
-                order: { points: "DESC" }
-            });
-
-            const payload = members.map((member) => ({
-                id: member.id,
-                customer_id: member.customer_id,
-                points: Number(member.points || 0),
-                tier: member.tier,
-                total_spent: Number(member.total_spent || 0),
-                created_at: member.created_at,
-                customer: member.customer
-                    ? {
-                        id: member.customer.id,
-                        name: member.customer.name,
-                        phone: member.customer.phone,
-                    }
-                    : null,
-            }));
-
-            return res.json(payload);
+            const vouchers: Array<Record<string, unknown>> = await AppDataSource.query(`
+                SELECT voucher.id, voucher.customer_id,
+                    COALESCE(SUM(entry.points), 0)::text AS points,
+                    'Bronze' AS tier,
+                    customer.total_purchases AS total_spent,
+                    voucher.created_at,
+                    json_build_object('id', customer.id, 'name', customer.name, 'phone', customer.phone) AS customer
+                FROM customer_vouchers voucher
+                JOIN customers customer ON customer.id = voucher.customer_id
+                LEFT JOIN voucher_ledger entry ON entry.voucher_id = voucher.id
+                GROUP BY voucher.id, customer.id
+                ORDER BY COALESCE(SUM(entry.points), 0) DESC
+            `);
+            return res.json(vouchers);
         } catch (error) {
             console.error("Error fetching loyalty members:", error);
             return res.status(500).json({ message: "Error fetching loyalty members" });
         }
     }
 
-    static async createMember(req: Request, res: Response) {
+    static async createMember(req: AuthenticatedRequest, res: Response) {
         try {
-            const { customer_id, points, total_spent, tier } = sanitizeLoyaltyMemberPayload(req.body ?? {});
-
-            const existing = await loyaltyMemberRepository.findOne({ where: { customer_id } });
-            if (existing) {
-                return res.status(400).json({ message: "Loyalty member already exists for this customer" });
-            }
-
-            const customer = await customerRepository.findOneBy({ id: customer_id });
-            if (!customer) {
-                return res.status(404).json({ message: "Customer not found" });
-            }
-
-            const member = new LoyaltyMember();
-            member.customer = customer;
-            member.customer_id = customer.id;
-            member.points = Number(points || 0);
-            member.total_spent = Number(total_spent || 0);
-            member.tier = tier || getTierFromSpent(Number(total_spent || 0));
-
-            const saved = await loyaltyMemberRepository.save(member);
-            return res.status(201).json(saved);
+            const customerId = typeof req.body?.customer_id === "string" ? req.body.customer_id.trim() : "";
+            if (!customerId || !req.user?.id) return res.status(400).json({ message: "customer_id is required" });
+            const customer = await customerRepository.findOneBy({ id: customerId });
+            if (!customer) return res.status(404).json({ message: "Customer not found" });
+            const voucher = await AppDataSource.transaction((manager) =>
+                VoucherService.ensureForCustomer(manager, customer.id, req.user!.id, "customers_screen"));
+            return res.status(201).json({
+                id: voucher.id,
+                customer_id: customer.id,
+                points: String(await VoucherService.getBalance(AppDataSource.manager, voucher.id)),
+                tier: getTierFromSpent(Number(customer.total_purchases || 0)),
+                total_spent: customer.total_purchases,
+                customer: { id: customer.id, name: customer.name, phone: customer.phone },
+            });
         } catch (error) {
             console.error("Error creating loyalty member:", error);
             return res.status(400).json({ message: error instanceof Error ? error.message : "Error creating loyalty member" });
@@ -350,81 +378,17 @@ export class LoyaltyController {
     }
 
     static async addPoints(req: Request, res: Response) {
-        try {
-            const member = await loyaltyMemberRepository.findOne({
-                where: { id: req.params.id as string },
-                relations: ["customer"],
-            });
-
-            if (!member) {
-                return res.status(404).json({ message: "Loyalty member not found" });
-            }
-
-            const { points: pointsToAdd, amount: saleAmount } = sanitizeLoyaltyPointsPayload(req.body ?? {});
-
-            member.points += pointsToAdd;
-            member.total_spent = Number(member.total_spent || 0) + saleAmount;
-            member.tier = getTierFromSpent(Number(member.total_spent));
-
-            await loyaltyMemberRepository.save(member);
-            return res.json(member);
-        } catch (error) {
-            console.error("Error adding loyalty points:", error);
-            return res.status(400).json({ message: error instanceof Error ? error.message : "Error adding loyalty points" });
-        }
+        return res.status(410).json({ message: "Direct points editing is disabled; voucher points are earned through completed sales or an audited admin adjustment." });
     }
 
     static async redeemPoints(req: Request, res: Response) {
-        try {
-            const member = await loyaltyMemberRepository.findOne({
-                where: { id: req.params.id as string },
-                relations: ["customer"],
-            });
-
-            if (!member) {
-                return res.status(404).json({ message: "Loyalty member not found" });
-            }
-
-            const { points: pointsToRedeem } = sanitizeLoyaltyPointsPayload(req.body ?? {});
-            if (member.points < pointsToRedeem) {
-                return res.status(400).json({ message: "Insufficient loyalty points" });
-            }
-
-            member.points -= pointsToRedeem;
-            member.tier = getTierFromSpent(Number(member.total_spent));
-
-            await loyaltyMemberRepository.save(member);
-            return res.json(member);
-        } catch (error) {
-            console.error("Error redeeming loyalty points:", error);
-            return res.status(400).json({ message: error instanceof Error ? error.message : "Error redeeming loyalty points" });
-        }
+        return res.status(410).json({ message: "Direct points editing is disabled; redeem voucher points during checkout." });
     }
 
-    static async ensureMemberForCustomer(customerId: string, saleAmount: number, pointsToAward: number) {
-        const member = await loyaltyMemberRepository.findOne({
-            where: { customer_id: customerId },
-            relations: ["customer"],
-        });
-
-        if (member) {
-            member.points += pointsToAward;
-            member.total_spent = Number(member.total_spent || 0) + saleAmount;
-            member.tier = getTierFromSpent(Number(member.total_spent));
-            return loyaltyMemberRepository.save(member);
-        }
-
+    static async ensureMemberForCustomer(customerId: string, _saleAmount: number, _pointsToAward: number) {
         const customer = await customerRepository.findOneBy({ id: customerId });
-        if (!customer) {
-            return null;
-        }
-
-        const newMember = new LoyaltyMember();
-        newMember.customer = customer;
-        newMember.customer_id = customer.id;
-        newMember.points = pointsToAward;
-        newMember.total_spent = saleAmount;
-        newMember.tier = getTierFromSpent(Number(saleAmount));
-        return loyaltyMemberRepository.save(newMember);
+        if (!customer) return null;
+        return AppDataSource.transaction((manager) =>
+            VoucherService.ensureForCustomer(manager, customerId, "system"));
     }
 }

@@ -15,15 +15,17 @@ import {
   AlertCircle,
 } from "lucide-react";
 import { PaymentStatus } from "@/hooks/useHybridPayment";
+import { centsToKesString, formatKesCents, parseKesToCents } from "@/lib/exactMoney";
 
 interface HybridPaymentPanelProps {
-  totalAmount: number;
-  cashAmount: number;
-  mpesaAmount: number;
-  storeCreditAmount: number;
-  storeCreditAccountBalance: number;
-  remainingAmount: number;
-  changeAmount: number;
+  totalAmountCents: number;
+  promotionSavingsCents?: number;
+  cashAmountCents: number;
+  mpesaAmountCents: number;
+  storeCreditAmountCents: number;
+  storeCreditAccountBalanceCents: number;
+  remainingAmountCents: number;
+  changeAmountCents: number;
   status: PaymentStatus;
   mpesaPending: boolean;
   checkoutReserved: boolean;
@@ -35,11 +37,11 @@ interface HybridPaymentPanelProps {
   stkPushIssues?: string[];
   paybillReference: string | null;
   paybillAmount: number | null;
-  onCashAmountChange: (amount: number) => Promise<boolean> | void;
-  onMpesaPayment: (phone: string, amount: number) => Promise<boolean>;
-  onPaybillPayment: (phone: string, amount: number) => Promise<boolean>;
+  onCashAmountChange: (amountCents: number) => Promise<boolean> | void;
+  onMpesaPayment: (phone: string, amountShillings: number) => Promise<boolean>;
+  onPaybillPayment: (phone: string, amountShillings: number) => Promise<boolean>;
   onStoreCreditPayment: (
-    amount: number,
+    amountCents: number,
     barcode: string | null,
   ) => Promise<boolean | void> | void;
   onCompleteSale: () => void;
@@ -49,13 +51,14 @@ interface HybridPaymentPanelProps {
 }
 
 export function HybridPaymentPanel({
-  totalAmount,
-  cashAmount,
-  mpesaAmount,
-  storeCreditAmount,
-  storeCreditAccountBalance,
-  remainingAmount,
-  changeAmount,
+  totalAmountCents,
+  promotionSavingsCents = 0,
+  cashAmountCents,
+  mpesaAmountCents,
+  storeCreditAmountCents,
+  storeCreditAccountBalanceCents,
+  remainingAmountCents,
+  changeAmountCents,
   status,
   mpesaPending,
   checkoutReserved,
@@ -82,7 +85,9 @@ export function HybridPaymentPanel({
 
   const [scInput, setScInput] = useState("");
   const [scBarcode, setScBarcode] = useState("");
-  const [barcodeBalance, setBarcodeBalance] = useState<number | null>(null);
+  const [barcodeBalanceCents, setBarcodeBalanceCents] = useState<number | null>(null);
+  const [cashInputError, setCashInputError] = useState("");
+  const [mpesaAmountError, setMpesaAmountError] = useState("");
   const [barcodeLookupState, setBarcodeLookupState] = useState<
     "idle" | "loading" | "valid" | "invalid"
   >("idle");
@@ -91,13 +96,13 @@ export function HybridPaymentPanel({
   useEffect(() => {
     const barcode = scBarcode.trim();
     if (!barcode) {
-      setBarcodeBalance(null);
+      setBarcodeBalanceCents(null);
       setBarcodeLookupState("idle");
       return;
     }
 
     let cancelled = false;
-    setBarcodeBalance(null);
+    setBarcodeBalanceCents(null);
     setBarcodeLookupState("loading");
     const timeoutId = window.setTimeout(() => {
       ApiService.get<{ barcode: string; current_balance: number }>(
@@ -105,12 +110,12 @@ export function HybridPaymentPanel({
       )
         .then((credit) => {
           if (cancelled) return;
-          setBarcodeBalance(Number(credit.current_balance));
+          setBarcodeBalanceCents(parseKesToCents(String(credit.current_balance)));
           setBarcodeLookupState("valid");
         })
         .catch(() => {
           if (cancelled) return;
-          setBarcodeBalance(null);
+          setBarcodeBalanceCents(null);
           setBarcodeLookupState("invalid");
         });
     }, 300);
@@ -121,33 +126,52 @@ export function HybridPaymentPanel({
     };
   }, [scBarcode]);
 
-  const availableStoreCredit = scBarcode.trim()
-    ? barcodeBalance ?? 0
-    : Number(storeCreditAccountBalance) || 0;
-  const maximumStoreCreditPayment = Math.min(
-    availableStoreCredit,
-    remainingAmount,
+  const availableStoreCreditCents = scBarcode.trim()
+    ? barcodeBalanceCents ?? 0
+    : storeCreditAccountBalanceCents;
+  const maximumStoreCreditPaymentCents = Math.min(
+    availableStoreCreditCents,
+    remainingAmountCents,
   );
-  const storeCreditAmountExceedsBalance =
-    scInput !== "" &&
-    Number.isFinite(Number(scInput)) &&
-    Number(scInput) > maximumStoreCreditPayment;
+  const parsedStoreCreditCents = (() => {
+    if (!scInput) return null;
+    try {
+      return parseKesToCents(scInput);
+    } catch {
+      return null;
+    }
+  })();
+  const storeCreditAmountExceedsBalance = parsedStoreCreditCents !== null &&
+    parsedStoreCreditCents > maximumStoreCreditPaymentCents;
 
   const handleCashSubmit = async () => {
-    const amount = parseFloat(cashInput);
-    if (amount > 0) {
-      await onCashAmountChange(amount);
-      setCashInput("");
+    setCashInputError("");
+    try {
+      const amountCents = parseKesToCents(cashInput);
+      if (amountCents > 0) {
+        await onCashAmountChange(amountCents);
+        setCashInput("");
+      }
+    } catch {
+      setCashInputError("Enter a KES amount with at most two decimal places.");
     }
   };
 
-  const handleQuickCash = async (amount: number) => {
-    await onCashAmountChange(amount);
+  const handleQuickCash = async (amountCents: number) => {
+    await onCashAmountChange(amountCents);
   };
 
   const handleMpesaSubmit = async () => {
-    const amount = parseFloat(mpesaAmountInput) || Math.floor(remainingAmount);
-    if (amount > 0 && mpesaPhone) {
+    const amountInputIsWholeShillings = /^\d+(?:\.0{1,2})?$/.test(mpesaAmountInput);
+    const amount = mpesaAmountInput === ""
+      ? Math.floor(remainingAmountCents / 100)
+      : amountInputIsWholeShillings ? Number(mpesaAmountInput) : NaN;
+    if (!Number.isSafeInteger(amount) || amount <= 0) {
+      setMpesaAmountError("Enter a positive whole-shilling M-Pesa amount.");
+      return;
+    }
+    if (Number.isSafeInteger(amount) && amount > 0 && mpesaPhone) {
+      setMpesaAmountError("");
       const success = await onMpesaPayment(mpesaPhone, amount);
       if (success) {
         setMpesaAmountInput("");
@@ -156,16 +180,24 @@ export function HybridPaymentPanel({
   };
 
   const handlePaybillSubmit = async () => {
-    const amount = parseFloat(mpesaAmountInput) || Math.floor(remainingAmount);
-    if (amount > 0 && mpesaPhone) {
+    const amountInputIsWholeShillings = /^\d+(?:\.0{1,2})?$/.test(mpesaAmountInput);
+    const amount = mpesaAmountInput === ""
+      ? Math.floor(remainingAmountCents / 100)
+      : amountInputIsWholeShillings ? Number(mpesaAmountInput) : NaN;
+    if (!Number.isSafeInteger(amount) || amount <= 0) {
+      setMpesaAmountError("Enter a positive whole-shilling M-Pesa amount.");
+      return;
+    }
+    if (Number.isSafeInteger(amount) && amount > 0 && mpesaPhone) {
+      setMpesaAmountError("");
       await onPaybillPayment(mpesaPhone, amount);
     }
   };
 
   const handleStoreCreditSubmit = async () => {
-    const amount = parseFloat(scInput);
-    if (amount > 0 && amount <= maximumStoreCreditPayment) {
-      await onStoreCreditPayment(amount, scBarcode.trim() || null);
+    if (parsedStoreCreditCents !== null && parsedStoreCreditCents > 0 &&
+        parsedStoreCreditCents <= maximumStoreCreditPaymentCents) {
+      await onStoreCreditPayment(parsedStoreCreditCents, scBarcode.trim() || null);
       setScInput("");
       setScBarcode("");
       setStoreCreditInputError("");
@@ -233,42 +265,47 @@ export function HybridPaymentPanel({
         )}
         {/* Amount Summary */}
         <div className="rounded-lg bg-muted p-4 space-y-2">
+          {promotionSavingsCents > 0 && (
+            <div className="flex justify-between text-sm font-medium text-green-700">
+              <span>Promotion savings:</span>
+              <span>-{formatKesCents(promotionSavingsCents)}</span>
+            </div>
+          )}
           <div className="flex justify-between text-sm">
             <span>Total Amount:</span>
             <span className="font-bold">
-              KES {totalAmount.toLocaleString()}
+              {formatKesCents(totalAmountCents)}
             </span>
           </div>
-          {cashAmount > 0 && (
+          {cashAmountCents > 0 && (
             <div className="flex justify-between text-sm text-green-600">
               <span>Cash Paid:</span>
-              <span>KES {cashAmount.toLocaleString()}</span>
+              <span>{formatKesCents(cashAmountCents)}</span>
             </div>
           )}
-          {mpesaAmount > 0 && (
+          {mpesaAmountCents > 0 && (
             <div className="flex justify-between text-sm text-green-600">
               <span>M-Pesa Paid:</span>
-              <span>KES {mpesaAmount.toLocaleString()}</span>
+              <span>{formatKesCents(mpesaAmountCents)}</span>
             </div>
           )}
-          {storeCreditAmount > 0 && (
+          {storeCreditAmountCents > 0 && (
             <div className="flex justify-between text-sm text-green-600">
               <span>Store Credit:</span>
-              <span>KES {storeCreditAmount.toLocaleString()}</span>
+              <span>{formatKesCents(storeCreditAmountCents)}</span>
             </div>
           )}
           <Separator />
           <div className="flex justify-between font-bold">
-            <span>{remainingAmount > 0 ? "Remaining:" : "Change:"}</span>
+            <span>{remainingAmountCents > 0 ? "Remaining:" : "Change:"}</span>
             <span
               className={
-                remainingAmount > 0 ? "text-destructive" : "text-green-600"
+                remainingAmountCents > 0 ? "text-destructive" : "text-green-600"
               }
             >
-              KES{" "}
-              {remainingAmount > 0
-                ? remainingAmount.toLocaleString()
-                : changeAmount.toLocaleString()}
+              {formatKesCents(remainingAmountCents > 0
+                ? remainingAmountCents
+                : changeAmountCents)}
             </span>
           </div>
         </div>
@@ -282,10 +319,14 @@ export function HybridPaymentPanel({
             </Label>
             <div className="flex gap-2">
               <Input
-                type="number"
+                type="text"
+                inputMode="decimal"
                 placeholder="Enter cash amount"
                 value={cashInput}
-                onChange={(e) => setCashInput(e.target.value)}
+                onChange={(e) => {
+                  setCashInput(e.target.value);
+                  setCashInputError("");
+                }}
                 disabled={disabled || mpesaPending || checkoutReserved}
                 min="0"
               />
@@ -297,6 +338,7 @@ export function HybridPaymentPanel({
                 Add
               </Button>
             </div>
+            {cashInputError && <p className="text-sm text-destructive" role="alert">{cashInputError}</p>}
             {/* Quick amounts */}
             <div className="flex flex-wrap gap-2">
               {[100, 200, 500, 1000].map((amount) => (
@@ -304,22 +346,22 @@ export function HybridPaymentPanel({
                   key={amount}
                   variant="outline"
                   size="sm"
-                  onClick={() => handleQuickCash(cashAmount + amount)}
+                  onClick={() => handleQuickCash(cashAmountCents + amount * 100)}
                   disabled={disabled || mpesaPending || checkoutReserved}
                 >
                   +{amount}
                 </Button>
               ))}
-              {remainingAmount > 0 && (
+              {remainingAmountCents > 0 && (
                 <Button
                   variant="outline"
                   size="sm"
                   onClick={() =>
-                    handleQuickCash(totalAmount - mpesaAmount - storeCreditAmount)
+                    handleQuickCash(totalAmountCents - mpesaAmountCents - storeCreditAmountCents)
                   }
                   disabled={disabled || mpesaPending || checkoutReserved}
                 >
-                  Exact ({remainingAmount.toLocaleString()})
+                  Exact ({formatKesCents(remainingAmountCents)})
                 </Button>
               )}
             </div>
@@ -343,7 +385,7 @@ export function HybridPaymentPanel({
                   onChange={(e) => {
                     const value = e.target.value;
                     setScBarcode(value);
-                    setBarcodeBalance(null);
+                    setBarcodeBalanceCents(null);
                     setBarcodeLookupState(value.trim() ? "loading" : "idle");
                     setStoreCreditInputError("");
                   }}
@@ -362,43 +404,38 @@ export function HybridPaymentPanel({
                       ? "Checking voucher balance..."
                       : barcodeLookupState === "invalid"
                         ? "This barcode is invalid, expired, inactive, or has no balance."
-                        : barcodeBalance !== null
-                          ? `Voucher balance: KES ${barcodeBalance.toLocaleString(
-                              "en-KE",
-                              { minimumFractionDigits: 2 },
-                            )}`
+                        : barcodeBalanceCents !== null
+                          ? `Voucher balance: ${formatKesCents(barcodeBalanceCents)}`
                           : ""}
                   </p>
                 )}
                 <div className="flex gap-2">
                   <Input
-                    type="number"
+                    type="text"
+                    inputMode="decimal"
                     placeholder={
-                      maximumStoreCreditPayment > 0
-                        ? `Amount to deduct (max ${maximumStoreCreditPayment.toLocaleString(
-                            "en-KE",
-                            { minimumFractionDigits: 2 },
-                          )})`
+                      maximumStoreCreditPaymentCents > 0
+                        ? `Amount to deduct (max ${formatKesCents(maximumStoreCreditPaymentCents)})`
                         : "Amount to deduct"
                     }
                     value={scInput}
                     onChange={(e) => {
                       const value = e.target.value;
                       setStoreCreditInputError("");
-                      if (
-                        value !== "" &&
-                        Number.isFinite(Number(value)) &&
-                        Number(value) > maximumStoreCreditPayment
-                      ) {
-                        setStoreCreditInputError(
-                          `Amount cannot exceed the available store credit of KES ${maximumStoreCreditPayment.toLocaleString(
-                            "en-KE",
-                            { minimumFractionDigits: 2 },
-                          )}.`,
-                        );
+                      setScInput(value);
+                      if (!value) return;
+                      let valueCents: number;
+                      try {
+                        valueCents = parseKesToCents(value);
+                      } catch {
+                        setStoreCreditInputError("Enter a KES amount with at most two decimal places.");
                         return;
                       }
-                      setScInput(value);
+                      if (valueCents > maximumStoreCreditPaymentCents) {
+                        setStoreCreditInputError(
+                          `Amount cannot exceed the available store credit of ${formatKesCents(maximumStoreCreditPaymentCents)}.`,
+                        );
+                      }
                     }}
                     disabled={
                       disabled ||
@@ -407,8 +444,7 @@ export function HybridPaymentPanel({
                       (scBarcode.trim() !== "" && barcodeLookupState !== "valid")
                     }
                     min="0"
-                    max={maximumStoreCreditPayment}
-                    step="0.01"
+                    max={centsToKesString(maximumStoreCreditPaymentCents)}
                     aria-label="Amount of store credit to use"
                     aria-invalid={storeCreditAmountExceedsBalance}
                   />
@@ -419,7 +455,8 @@ export function HybridPaymentPanel({
                       mpesaPending ||
                       checkoutReserved ||
                       !scInput ||
-                      maximumStoreCreditPayment <= 0 ||
+                      parsedStoreCreditCents === null ||
+                      maximumStoreCreditPaymentCents <= 0 ||
                       storeCreditAmountExceedsBalance ||
                       (scBarcode.trim() !== "" && barcodeLookupState !== "valid")
                     }
@@ -431,18 +468,12 @@ export function HybridPaymentPanel({
                 {(storeCreditInputError || storeCreditAmountExceedsBalance) && (
                   <p className="text-sm text-destructive" role="alert">
                     {storeCreditInputError ||
-                      `Amount cannot exceed the available store credit of KES ${maximumStoreCreditPayment.toLocaleString(
-                        "en-KE",
-                        { minimumFractionDigits: 2 },
-                      )}.`}
+                      `Amount cannot exceed the available store credit of ${formatKesCents(maximumStoreCreditPaymentCents)}.`}
                   </p>
                 )}
-                {!scBarcode.trim() && storeCreditAccountBalance > 0 && (
+                {!scBarcode.trim() && storeCreditAccountBalanceCents > 0 && (
                   <p className="text-sm text-muted-foreground">
-                    Customer account credit: KES{" "}
-                    {storeCreditAccountBalance.toLocaleString("en-KE", {
-                      minimumFractionDigits: 2,
-                    })}
+                    Customer account credit: {formatKesCents(storeCreditAccountBalanceCents)}
                   </p>
                 )}
               </div>
@@ -459,7 +490,7 @@ export function HybridPaymentPanel({
                 <Smartphone className="h-4 w-4" />
                 M-Pesa Payment
               </Label>
-              {stkPushEnabled === false && (
+              {stkPushEnabled !== true && (
                 <div
                   role="alert"
                   className="rounded-md border border-amber-300 bg-amber-50 p-3 text-sm text-amber-950"
@@ -495,16 +526,20 @@ export function HybridPaymentPanel({
                 <div className="flex gap-2">
                   <Input
                     type="number"
-                    placeholder={`Amount (default: ${remainingAmount.toLocaleString()})`}
+                    placeholder={`Amount (default: ${Math.floor(remainingAmountCents / 100).toLocaleString()})`}
                     value={mpesaAmountInput}
-                    onChange={(e) => setMpesaAmountInput(e.target.value)}
+                    onChange={(e) => {
+                      setMpesaAmountInput(e.target.value);
+                      setMpesaAmountError("");
+                    }}
                     disabled={disabled || mpesaPending}
                     min="1"
+                    step="1"
                   />
                   <div className="flex gap-2">
                     <Button
                       onClick={handleMpesaSubmit}
-                      disabled={disabled || mpesaPending || !mpesaPhone || stkPushEnabled === false}
+                      disabled={disabled || mpesaPending || !mpesaPhone || stkPushEnabled !== true}
                       className="min-w-[100px]"
                     >
                       {mpesaPending && !paybillReference ? (
@@ -526,6 +561,7 @@ export function HybridPaymentPanel({
                       </Button>
                     )}
                   </div>
+                  {mpesaAmountError && <p className="text-sm text-destructive" role="alert">{mpesaAmountError}</p>}
                 </div>
               </div>
               {paybillReference && paybillNumber && (
@@ -533,7 +569,7 @@ export function HybridPaymentPanel({
                   <p className="font-semibold">Customer pays using M-Pesa Paybill</p>
                   <p>Paybill: <strong>{paybillNumber}</strong></p>
                   <p>Account number: <strong className="select-all">{paybillReference}</strong></p>
-                  <p>Amount: <strong>KES {(paybillAmount ?? Math.floor(remainingAmount)).toLocaleString()}</strong></p>
+                  <p>Amount: <strong>KES {(paybillAmount ?? Math.floor(remainingAmountCents / 100)).toLocaleString()}</strong></p>
                   <p className="text-muted-foreground">Keep this checkout open while Safaricom confirms payment.</p>
                 </div>
               )}
@@ -561,7 +597,7 @@ export function HybridPaymentPanel({
               Complete Sale & Print Receipt
             </>
           ) : (
-            `Awaiting KES ${remainingAmount.toLocaleString()}`
+            `Awaiting ${formatKesCents(remainingAmountCents)}`
           )}
         </Button>
       </CardContent>

@@ -75,7 +75,7 @@ export default function StockTakes() {
     { id: string; counted_quantity: number | null }[]
   >([]);
 
-  const isAdmin = role === "admin";
+  const canManageStockTakes = role === "admin" || role === "manager" || role === "supervisor";
 
   useEffect(() => {
     loadData();
@@ -341,7 +341,7 @@ export default function StockTakes() {
             Manage cycle counting and physical inventory reconciliation
           </p>
         </div>
-        {isAdmin && (
+        {canManageStockTakes && (
           <Dialog open={dialogOpen} onOpenChange={setDialogOpen}>
             <DialogTrigger asChild>
               <Button>
@@ -441,7 +441,7 @@ export default function StockTakes() {
                       {take.notes}
                     </TableCell>
                     <TableCell className="text-right">
-                      {isAdmin &&
+                      {canManageStockTakes &&
                         (take.status === "pending" ||
                           take.status === "in_progress") && (
                           <Button

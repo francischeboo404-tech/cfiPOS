@@ -42,6 +42,10 @@ import {
 } from "lucide-react";
 import { useAuth } from "@/hooks/useAuthContext";
 import { Checkbox } from "@/components/ui/checkbox";
+import {
+  formatKesCents,
+  parseKesToCents,
+} from "@/lib/exactMoney";
 
 interface ReturnItem {
   id: string;
@@ -50,8 +54,15 @@ interface ReturnItem {
   sale_item: {
     id: string;
     quantity: number;
-    unit_price: number;
-    tax_rate: number;
+    unit_price: number | string;
+    tax_rate: number | string;
+    line_total?: number | string;
+    line_total_cents?: string | null;
+    discount_cents?: string | null;
+    net_revenue_cents?: string | null;
+    vat_cents?: string | null;
+    returnable_quantity?: number;
+    approved_returned_quantity?: number;
     product: { name: string };
   };
 }
@@ -66,14 +77,14 @@ interface Return {
   created_at: string;
   rejection_reason: string | null;
   mpesa_refund_status: "not_required" | "pending" | "completed";
-  mpesa_refund_amount: number;
+  mpesa_refund_amount: number | string;
   mpesa_refund_receipt: string | null;
   mpesa_refund_completed_at: string | null;
   pesapal_refund_logged: boolean;
   pesapal_refund_notes: string | null;
   store_credit_voucher?: {
     barcode: string;
-    current_balance: number;
+    current_balance: number | string;
     status: string;
     expires_at: string | null;
   } | null;
@@ -86,8 +97,15 @@ interface Return {
 interface SaleItem {
   id: string;
   quantity: number;
-  unit_price: number;
-  tax_rate: number;
+  unit_price: number | string;
+  tax_rate: number | string;
+  line_total?: number | string;
+  line_total_cents?: string | null;
+  discount_cents?: string | null;
+  net_revenue_cents?: string | null;
+  vat_cents?: string | null;
+  returnable_quantity: number;
+  approved_returned_quantity: number;
   product: { name: string } | null;
 }
 
@@ -96,7 +114,7 @@ interface Sale {
   invoice_number: string;
   status: string;
   payment_status: string;
-  total_amount: number;
+  total_amount: number | string;
   created_at: string;
   payment_method: string;
   items: SaleItem[];
@@ -215,19 +233,50 @@ export default function Returns() {
     }
   };
 
-  const calculateReturnAmount = () => {
-    if (!selectedSale) return 0;
-    let total = 0;
+  const calculateReturnAmountCents = () => {
+    if (!selectedSale) return 0n;
+    let totalCents = 0n;
     for (const itemId in selectedReturnItems) {
       const saleItem = selectedSale.items.find((i) => i.id === itemId);
       if (saleItem) {
         const qty = selectedReturnItems[itemId];
-        const proportionalPrice = saleItem.unit_price * qty; // assuming unit_price is base
-        const tax = (saleItem.tax_rate / 100) * proportionalPrice;
-        total += proportionalPrice + tax;
+        const lineGrossCents = saleItem.line_total_cents !== null &&
+            saleItem.line_total_cents !== undefined
+          ? BigInt(saleItem.line_total_cents)
+          : saleItem.line_total !== undefined
+            ? BigInt(parseKesToCents(String(saleItem.line_total)))
+            : BigInt(parseKesToCents(String(saleItem.unit_price))) *
+              BigInt(saleItem.quantity);
+        const lineDiscountCents = BigInt(saleItem.discount_cents || "0");
+        const netRevenueCents = saleItem.net_revenue_cents !== null &&
+            saleItem.net_revenue_cents !== undefined
+          ? BigInt(saleItem.net_revenue_cents)
+          : lineGrossCents - lineDiscountCents;
+        let vatCents: bigint;
+        if (saleItem.vat_cents !== null && saleItem.vat_cents !== undefined) {
+          vatCents = BigInt(saleItem.vat_cents);
+        } else {
+          const rateMatch = /^(\d+)(?:\.(\d{1,2}))?$/.exec(
+            String(saleItem.tax_rate).trim(),
+          );
+          if (!rateMatch) {
+            throw new Error("Tax rate must have at most two decimal places");
+          }
+          const rateBasisPoints = BigInt(rateMatch[1]) * 100n +
+            BigInt((rateMatch[2] || "").padEnd(2, "0") || "0");
+          const vatNumerator = lineGrossCents * rateBasisPoints;
+          vatCents = (vatNumerator + 5_000n) / 10_000n;
+        }
+        const returnedBefore = saleItem.approved_returned_quantity;
+        const returnedAfter = returnedBefore + qty;
+        const quantity = BigInt(saleItem.quantity);
+        const allocateShare = (amount: bigint) =>
+          amount * BigInt(returnedAfter) / quantity -
+          amount * BigInt(returnedBefore) / quantity;
+        totalCents += allocateShare(netRevenueCents) + allocateShare(vatCents);
       }
     }
-    return total;
+    return totalCents;
   };
 
   const handleSubmit = async (e: React.FormEvent) => {
@@ -456,10 +505,7 @@ export default function Returns() {
                           </p>
                         </div>
                         <p className="font-semibold">
-                          KSh{" "}
-                          {sale.total_amount.toLocaleString("en-KE", {
-                            minimumFractionDigits: 2,
-                          })}
+                          {formatKesCents(parseKesToCents(String(sale.total_amount)))}
                         </p>
                       </div>
                     </div>
@@ -496,18 +542,23 @@ export default function Returns() {
                                 onCheckedChange={(checked) =>
                                   handleToggleItem(
                                     item.id,
-                                    item.quantity,
+                                    item.returnable_quantity,
                                     checked as boolean,
                                   )
                                 }
+                                disabled={item.returnable_quantity === 0}
                               />
                               <div>
                                 <p className="text-sm font-medium">
                                   {item.product?.name}
                                 </p>
                                 <p className="text-xs text-muted-foreground">
-                                  Purchased: {item.quantity} | KSh{" "}
-                                  {item.unit_price} each
+                                  Purchased: {item.quantity} | Remaining:{" "}
+                                  {item.returnable_quantity} |{" "}
+                                  {formatKesCents(
+                                    parseKesToCents(String(item.unit_price)),
+                                  )}{" "}
+                                  each
                                 </p>
                               </div>
                             </div>
@@ -518,12 +569,12 @@ export default function Returns() {
                                   type="number"
                                   className="w-20 h-8"
                                   min="1"
-                                  max={item.quantity}
+                                  max={item.returnable_quantity}
                                   value={selectedReturnItems[item.id]}
                                   onChange={(e) =>
                                     handleUpdateItemQuantity(
                                       item.id,
-                                      item.quantity,
+                                      item.returnable_quantity,
                                       e.target.value,
                                     )
                                   }
@@ -537,10 +588,7 @@ export default function Returns() {
                     <div className="mt-3 flex justify-between items-center text-sm font-bold pt-2 border-t">
                       <span>Estimated Refund:</span>
                       <span className="text-primary text-lg">
-                        KSh{" "}
-                        {calculateReturnAmount().toLocaleString("en-KE", {
-                          minimumFractionDigits: 2,
-                        })}
+                        {formatKesCents(calculateReturnAmountCents())}
                       </span>
                     </div>
                   </div>
@@ -684,10 +732,12 @@ export default function Returns() {
                           <span className="block text-xs mt-1">
                             Voucher: <strong>{ret.store_credit_voucher.barcode}</strong>
                             <br />
-                            Balance: KSh{" "}
-                            {Number(ret.store_credit_voucher.current_balance).toLocaleString("en-KE", {
-                              minimumFractionDigits: 2,
-                            })}
+                            Balance:{" "}
+                            {formatKesCents(
+                              parseKesToCents(
+                                String(ret.store_credit_voucher.current_balance),
+                              ),
+                            )}
                           </span>
                         )}
                       </TableCell>
@@ -837,10 +887,8 @@ export default function Returns() {
                             {item.condition.replace("_", " ")}
                           </TableCell>
                           <TableCell className="text-right">
-                            KSh{" "}
-                            {Number(item.sale_item.unit_price).toLocaleString(
-                              "en-KE",
-                              { minimumFractionDigits: 2 },
+                            {formatKesCents(
+                              parseKesToCents(String(item.sale_item.unit_price)),
                             )}
                           </TableCell>
                         </TableRow>
@@ -868,12 +916,12 @@ export default function Returns() {
                   </p>
                   <div className="mt-2 grid gap-2 text-sm sm:grid-cols-2">
                     <p>
-                      Remaining balance: KSh{" "}
-                      {Number(
-                        viewingReturn.store_credit_voucher.current_balance,
-                      ).toLocaleString("en-KE", {
-                        minimumFractionDigits: 2,
-                      })}
+                      Remaining balance:{" "}
+                      {formatKesCents(
+                        parseKesToCents(
+                          String(viewingReturn.store_credit_voucher.current_balance),
+                        ),
+                      )}
                     </p>
                     <p className="capitalize">
                       Voucher status: {viewingReturn.store_credit_voucher.status}
@@ -895,16 +943,14 @@ export default function Returns() {
               )}
 
               {viewingReturn.refund_method === "mpesa" &&
-                viewingReturn.mpesa_refund_amount > 0 && (
+                parseKesToCents(String(viewingReturn.mpesa_refund_amount)) > 0 && (
                   <section className="rounded-md border p-4">
                     <h3 className="font-semibold">M-Pesa refund settlement</h3>
                     <p>
-                      Amount: KSh{" "}
-                      {Number(
-                        viewingReturn.mpesa_refund_amount,
-                      ).toLocaleString("en-KE", {
-                        minimumFractionDigits: 2,
-                      })}
+                      Amount:{" "}
+                      {formatKesCents(
+                        parseKesToCents(String(viewingReturn.mpesa_refund_amount)),
+                      )}
                     </p>
                     <p className="capitalize">
                       Status:{" "}
@@ -1046,10 +1092,10 @@ export default function Returns() {
             <div className="space-y-4">
               <p className="text-sm text-muted-foreground">
                 First complete the refund through Safaricom. Then enter the
-                receipt shown for the successful payout. The KSh{" "}
-                {Number(payoutReturn.mpesa_refund_amount).toLocaleString("en-KE", {
-                  minimumFractionDigits: 2,
-                })}{" "}
+                receipt shown for the successful payout. The{" "}
+                {formatKesCents(
+                  parseKesToCents(String(payoutReturn.mpesa_refund_amount)),
+                )}{" "}
                 ledger and shift totals will update only after this confirmation.
               </p>
               <div className="space-y-2">

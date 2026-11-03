@@ -12,6 +12,7 @@ import { WarehouseStock } from "../entity/WarehouseStock";
 import { ProductBatch } from "../entity/ProductBatch";
 import { Shift, ShiftStatus } from "../entity/Shift";
 import { PaymentCheckoutSession } from "../entity/PaymentCheckoutSession";
+import { centsToKesString, parseKesToCents } from "../lib/exactMoney";
 
 interface MpesaCallbackMetadataItem {
     Name?: string;
@@ -137,7 +138,7 @@ const makeC2bCallbackUrls = () => {
     return { validationUrl: validationUrl.toString(), confirmationUrl: confirmationUrl.toString() };
 };
 
-const parseC2bCallback = (input: unknown) => {
+export const parseC2bCallback = (input: unknown) => {
     if (!input || typeof input !== "object" || Array.isArray(input)) return null;
     const payload = input as Record<string, unknown>;
     const transactionCode = typeof payload.TransID === "string" ? payload.TransID.trim() : "";
@@ -145,12 +146,13 @@ const parseC2bCallback = (input: unknown) => {
         ? payload.BillRefNumber.trim().toUpperCase()
         : "";
     const shortcode = String(payload.BusinessShortCode ?? "").replace(/\D/g, "");
-    const amount = Number(payload.TransAmount);
+    const amountCents = callbackMoneyCents(payload.TransAmount);
+    if (amountCents === null) return null;
     const phoneNumber = normalizeMpesaPhone(payload.MSISDN);
     if (!/^[A-Za-z0-9]{1,32}$/.test(transactionCode) ||
         !/^[A-Z0-9]{8,20}$/.test(accountReference) ||
         !/^\d{5,7}$/.test(shortcode) ||
-        !Number.isFinite(amount) || amount <= 0 ||
+        amountCents <= 0n ||
         !phoneNumber) {
         return null;
     }
@@ -158,9 +160,29 @@ const parseC2bCallback = (input: unknown) => {
         transactionCode,
         accountReference,
         shortcode,
-        amountCents: Math.round(amount * 100),
+        amountCents,
         phoneNumber,
     };
+};
+
+const paymentAmountCents = (value: unknown, field: string): bigint => {
+    if (typeof value !== "string" && typeof value !== "number") {
+        throw new Error(`${field} must be a non-negative KES amount with at most two decimal places`);
+    }
+    try {
+        return parseKesToCents(String(value));
+    } catch {
+        throw new Error(`${field} must be a non-negative KES amount with at most two decimal places`);
+    }
+};
+
+const callbackMoneyCents = (value: unknown): bigint | null => {
+    if (typeof value !== "string" && typeof value !== "number") return null;
+    try {
+        return parseKesToCents(String(value));
+    } catch {
+        return null;
+    }
 };
 
 export const sanitizeMpesaStkPayload = (input: unknown) => {
@@ -171,10 +193,12 @@ export const sanitizeMpesaStkPayload = (input: unknown) => {
     const payload = input as Record<string, unknown>;
     const phone_number = typeof payload.phone_number === "string" ? payload.phone_number.trim().replace(/\s+/g, "") : "";
     const checkout_session_id = typeof payload.checkout_session_id === "string" ? payload.checkout_session_id.trim() : "";
-    const amount = Number(payload.amount);
-    const loyalty_discount = Number(payload.loyalty_discount || 0);
-    const cash_amount = Number(payload.cash_amount || 0);
-    const store_credit_amount = Number(payload.store_credit_amount || 0);
+    const amountInput = typeof payload.amount === "string" || typeof payload.amount === "number"
+        ? String(payload.amount).trim()
+        : "";
+    const loyaltyDiscountCents = paymentAmountCents(payload.loyalty_discount ?? "0", "loyalty_discount");
+    const cashAmountCents = paymentAmountCents(payload.cash_amount ?? "0", "cash_amount");
+    const storeCreditAmountCents = paymentAmountCents(payload.store_credit_amount ?? "0", "store_credit_amount");
     if (payload.warehouse_id !== undefined && payload.warehouse_id !== null && typeof payload.warehouse_id !== "string") {
         throw new Error("warehouse_id must be a string");
     }
@@ -191,13 +215,10 @@ export const sanitizeMpesaStkPayload = (input: unknown) => {
     if (!/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(checkout_session_id)) {
         throw new Error("checkout_session_id must be a valid UUID");
     }
-    if (!Number.isSafeInteger(amount) || amount <= 0) throw new Error("amount must be a positive whole number of shillings");
-    if (!Number.isFinite(loyalty_discount) || loyalty_discount < 0 ||
-        !Number.isFinite(cash_amount) || cash_amount < 0 ||
-        !Number.isFinite(store_credit_amount) || store_credit_amount < 0) {
-        throw new Error("Payment amounts and discount must be non-negative numbers");
+    if (!/^\d+$/.test(amountInput) || !Number.isSafeInteger(Number(amountInput)) || Number(amountInput) <= 0) {
+        throw new Error("amount must be a positive whole number of shillings");
     }
-    if (items.length === 0 || items.length > 100) throw new Error("items must contain between 1 and 100 products");
+    if (items.length > 100) throw new Error("items cannot contain more than 100 products");
     const sanitizedItems = items.map((item: unknown) => {
         if (!item || typeof item !== "object" || Array.isArray(item)) throw new Error("Each item must be an object");
         const itemPayload = item as Record<string, unknown>;
@@ -213,12 +234,12 @@ export const sanitizeMpesaStkPayload = (input: unknown) => {
 
     return {
         phone_number: phone_number.replace(/^0/, "254").replace(/^\+/, ""),
-        amount,
+        amount: Number(amountInput),
         checkout_session_id,
         items: sanitizedItems,
-        loyalty_discount,
-        cash_amount,
-        store_credit_amount,
+        loyaltyDiscountCents,
+        cashAmountCents,
+        storeCreditAmountCents,
         ...(store_credit_barcode ? { store_credit_barcode } : {}),
         warehouse_id: warehouse_id || undefined,
         account_reference: account_reference || undefined,
@@ -235,9 +256,9 @@ export class PaymentController {
                 amount,
                 checkout_session_id,
                 items,
-                loyalty_discount,
-                cash_amount,
-                store_credit_amount,
+                loyaltyDiscountCents,
+                cashAmountCents,
+                storeCreditAmountCents,
                 store_credit_barcode,
                 warehouse_id,
                 account_reference,
@@ -259,10 +280,16 @@ export class PaymentController {
                 checkoutSession.items.every((reservedItem) =>
                     items.some((item) => item.product_id === reservedItem.product_id &&
                         item.quantity === reservedItem.quantity));
-            if (!sameItems || Math.round(Number(checkoutSession.loyalty_discount) * 100) !== Math.round(loyalty_discount * 100) ||
+            if ((checkoutSession.purpose === "voucher_renewal" &&
+                    (items.length !== 0 || loyaltyDiscountCents !== 0n || storeCreditAmountCents !== 0n ||
+                        store_credit_barcode || warehouse_id)) ||
+                (checkoutSession.purpose === "sale" && items.length === 0)) {
+                return res.status(400).json({ error: "M-Pesa request does not match the checkout type" });
+            }
+            if (!sameItems || parseKesToCents(String(checkoutSession.loyalty_discount)) !== loyaltyDiscountCents ||
                 checkoutSession.warehouse_id !== (warehouse_id || null) ||
-                Math.round(Number(checkoutSession.cash_amount) * 100) !== Math.round(Number(cash_amount || 0) * 100) ||
-                Math.round(Number(checkoutSession.store_credit_amount) * 100) !== Math.round(Number(store_credit_amount || 0) * 100) ||
+                parseKesToCents(String(checkoutSession.cash_amount)) !== cashAmountCents ||
+                parseKesToCents(String(checkoutSession.store_credit_amount)) !== storeCreditAmountCents ||
                 checkoutSession.store_credit_barcode !== (store_credit_barcode || null)) {
                 return res.status(400).json({ error: "M-Pesa request details do not match the reserved checkout" });
             }
@@ -272,8 +299,7 @@ export class PaymentController {
             }
 
             const productRepository = AppDataSource.getRepository(Product);
-            let subtotal = 0;
-            let taxAmount = 0;
+            let subtotalCents = 0n;
             for (const item of items) {
                 const product = await productRepository.findOne({
                     where: { id: item.product_id },
@@ -305,15 +331,21 @@ export class PaymentController {
                     return res.status(400).json({ error: `${product.name} has stock pending a quality check` });
                 }
                 const checkoutItem = checkoutSession.items.find((reservedItem) => reservedItem.product_id === product.id);
-                const unitPrice = checkoutItem ? Number(checkoutItem.unit_price) : Number(product.retail_price);
-                const lineTotal = unitPrice * item.quantity;
-                const taxRate = checkoutItem
-                    ? Number(checkoutItem.tax_rate)
-                    : product.tax_class ? Number(product.tax_class.rate) : Number(product.tax_rate) || 0;
-                subtotal += lineTotal;
-                taxAmount += lineTotal * taxRate / 100;
+                if (!checkoutItem) {
+                    return res.status(400).json({ error: "Checkout item no longer matches the reserved sale" });
+                }
+                const segmentGrossCents = checkoutItem.price_segments?.length
+                    ? checkoutItem.price_segments.reduce(
+                        (sum, segment) =>
+                            sum + parseKesToCents(segment.unit_price) * BigInt(segment.quantity),
+                        0n,
+                    )
+                    : parseKesToCents(String(checkoutItem.unit_price)) * BigInt(item.quantity);
+                subtotalCents += segmentGrossCents;
             }
-            if (loyalty_discount > subtotal) return res.status(400).json({ error: "Discount exceeds sale subtotal" });
+            if (loyaltyDiscountCents > subtotalCents) {
+                return res.status(400).json({ error: "Discount exceeds sale subtotal" });
+            }
 
             const settingRepository = AppDataSource.getRepository(Setting);
             const [
@@ -372,8 +404,8 @@ export class PaymentController {
                 if (!lockedSession) {
                     return { ok: false as const, error: "Checkout is no longer active", status: 409 };
                 }
-                if (Math.round(Number(lockedSession.cash_amount) * 100) !== Math.round(Number(cash_amount || 0) * 100) ||
-                    Math.round(Number(lockedSession.store_credit_amount) * 100) !== Math.round(Number(store_credit_amount || 0) * 100) ||
+                if (parseKesToCents(String(lockedSession.cash_amount)) !== cashAmountCents ||
+                    parseKesToCents(String(lockedSession.store_credit_amount)) !== storeCreditAmountCents ||
                     lockedSession.store_credit_barcode !== (store_credit_barcode || null)) {
                     return { ok: false as const, error: "Payment amounts do not match the reserved checkout", status: 400 };
                 }
@@ -383,15 +415,23 @@ export class PaymentController {
                 if (existingTransactions.some((item) => item.status === "pending")) {
                     return { ok: false as const, error: "An M-Pesa request is already pending for this checkout", status: 409 };
                 }
+                if (lockedSession.purpose === "voucher_renewal" &&
+                    existingTransactions.some((item) => item.status === "needs_review")) {
+                    return {
+                        ok: false as const,
+                        error: "An M-Pesa payment is under review; an administrator must resolve it before another request",
+                        status: 409,
+                    };
+                }
                 const paidMpesaCents = existingTransactions
                     .filter((item) => item.status === "completed")
-                    .reduce((sum, item) => sum + Math.round(Number(item.amount) * 100), 0);
-                const remainingCents = Math.round(Number(lockedSession.total_amount) * 100) -
-                    Math.round(Number(lockedSession.cash_amount) * 100) -
-                    Math.round(Number(lockedSession.store_credit_amount) * 100) -
+                    .reduce((sum, item) => sum + parseKesToCents(String(item.amount)), 0n);
+                const remainingCents = parseKesToCents(String(lockedSession.total_amount)) -
+                    parseKesToCents(String(lockedSession.cash_amount)) -
+                    parseKesToCents(String(lockedSession.store_credit_amount)) -
                     paidMpesaCents;
-                const maximumPushCents = Math.floor(remainingCents / 100) * 100;
-                if (parsedAmount * 100 > maximumPushCents) {
+                const maximumPushCents = remainingCents / 100n * 100n;
+                if (BigInt(parsedAmount) * 100n > maximumPushCents) {
                     return { ok: false as const, error: "STK amount exceeds the remaining sale balance", status: 400 };
                 }
                 const pendingTransaction = manager.create(MpesaTransaction, {
@@ -627,18 +667,24 @@ export class PaymentController {
                 ? req.body.checkout_session_id.trim()
                 : "";
             const phoneNumber = normalizeMpesaPhone(req.body?.phone_number);
-            const amount = Number(req.body?.amount);
-            const cashAmount = Number(req.body?.cash_amount || 0);
-            const storeCreditAmount = Number(req.body?.store_credit_amount || 0);
+            const amountInput = typeof req.body?.amount === "string" || typeof req.body?.amount === "number"
+                ? String(req.body.amount).trim()
+                : "";
+            let cashAmountCents: bigint;
+            let storeCreditAmountCents: bigint;
+            try {
+                cashAmountCents = paymentAmountCents(req.body?.cash_amount ?? "0", "cash_amount");
+                storeCreditAmountCents = paymentAmountCents(req.body?.store_credit_amount ?? "0", "store_credit_amount");
+            } catch (error) {
+                return res.status(400).json({ message: error instanceof Error ? error.message : "Invalid payment amount" });
+            }
+            const amount = /^\d+$/.test(amountInput) ? Number(amountInput) : NaN;
             if (!/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(checkoutSessionId)) {
                 return res.status(400).json({ message: "checkout_session_id must be a valid UUID" });
             }
             if (!phoneNumber) return res.status(400).json({ message: "Valid Kenyan phone number is required" });
             if (!Number.isSafeInteger(amount) || amount <= 0) {
                 return res.status(400).json({ message: "Paybill amount must be a positive whole number of shillings" });
-            }
-            if (![cashAmount, storeCreditAmount].every((value) => Number.isFinite(value) && value >= 0)) {
-                return res.status(400).json({ message: "Checkout payment amounts must be non-negative numbers" });
             }
 
             const settingRepository = AppDataSource.getRepository(Setting);
@@ -671,8 +717,8 @@ export class PaymentController {
                 if (!session) {
                     return { ok: false as const, error: "Reserve stock for this checkout before accepting payment", status: 409 };
                 }
-                if (Math.round(Number(session.cash_amount) * 100) !== Math.round(cashAmount * 100) ||
-                    Math.round(Number(session.store_credit_amount) * 100) !== Math.round(storeCreditAmount * 100)) {
+                if (parseKesToCents(String(session.cash_amount)) !== cashAmountCents ||
+                    parseKesToCents(String(session.store_credit_amount)) !== storeCreditAmountCents) {
                     return { ok: false as const, error: "Payment amounts do not match the reserved checkout", status: 400 };
                 }
                 const transactions = await manager.find(MpesaTransaction, {
@@ -683,12 +729,12 @@ export class PaymentController {
                 }
                 const paidMpesaCents = transactions
                     .filter((item) => item.status === "completed")
-                    .reduce((sum, item) => sum + Math.round(Number(item.amount) * 100), 0);
-                const remainingCents = Math.round(Number(session.total_amount) * 100) -
-                    Math.round(Number(session.cash_amount) * 100) -
-                    Math.round(Number(session.store_credit_amount) * 100) -
+                    .reduce((sum, item) => sum + parseKesToCents(String(item.amount)), 0n);
+                const remainingCents = parseKesToCents(String(session.total_amount)) -
+                    parseKesToCents(String(session.cash_amount)) -
+                    parseKesToCents(String(session.store_credit_amount)) -
                     paidMpesaCents;
-                if (amount * 100 > remainingCents) {
+                if (BigInt(amount) * 100n > remainingCents) {
                     return { ok: false as const, error: "Paybill amount exceeds the remaining sale balance", status: 400 };
                 }
                 const transaction = manager.create(MpesaTransaction, {
@@ -751,7 +797,7 @@ export class PaymentController {
             const valid = paybill?.value === registeredShortcode?.value &&
                 callback.shortcode === paybill?.value &&
                 transaction &&
-                Math.round(Number(transaction.amount) * 100) === callback.amountCents &&
+                parseKesToCents(String(transaction.amount)) === callback.amountCents &&
                 transaction.phone_number === callback.phoneNumber;
             return res.json(valid
                 ? { ResultCode: 0, ResultDesc: "Accepted" }
@@ -797,7 +843,7 @@ export class PaymentController {
             }
             if (transaction.status === "completed" &&
                 transaction.mpesa_receipt_number === callback.transactionCode &&
-                Math.round(Number(transaction.amount) * 100) === callback.amountCents &&
+                parseKesToCents(String(transaction.amount)) === callback.amountCents &&
                 transaction.phone_number === callback.phoneNumber) {
                 await queryRunner.rollbackTransaction();
                 return res.json({ ResultCode: 0, ResultDesc: "Accepted" });
@@ -817,8 +863,8 @@ export class PaymentController {
             }
 
             const mismatchReasons: string[] = [];
-            if (Math.round(Number(transaction.amount) * 100) !== callback.amountCents) {
-                mismatchReasons.push(`Amount mismatch: expected KES ${transaction.amount}, received KES ${callback.amountCents / 100}`);
+            if (parseKesToCents(String(transaction.amount)) !== callback.amountCents) {
+                mismatchReasons.push(`Amount mismatch: expected KES ${transaction.amount}, received KES ${centsToKesString(callback.amountCents)}`);
             }
             if (transaction.phone_number !== callback.phoneNumber) {
                 mismatchReasons.push(`Phone mismatch: expected ${transaction.phone_number}, received ${callback.phoneNumber}`);
@@ -921,21 +967,32 @@ export class PaymentController {
                 if (transaction.status === "completed" && resultCode === 0) {
                     const metadata = stkCallback.CallbackMetadata?.Item || [];
                     const receipt = metadata.find((item) => item.Name === "MpesaReceiptNumber")?.Value;
-                    const callbackAmount = Number(metadata.find((item) => item.Name === "Amount")?.Value);
+                    const callbackAmountCents = callbackMoneyCents(metadata.find((item) => item.Name === "Amount")?.Value);
                     const callbackPhone = metadata.find((item) => item.Name === "PhoneNumber")?.Value;
                     const normalizedPhone = normalizeMpesaPhone(callbackPhone);
-                    if (typeof receipt === "string" && receipt.trim() && transaction.mpesa_receipt_number?.startsWith("RECON_")) {
-                        transaction.mpesa_receipt_number = receipt.trim();
-                        transaction.callback_received = true;
-                        transaction.callback_data = callback;
-                        await queryRunner.manager.save(transaction);
-                        await queryRunner.commitTransaction();
-                        return res.status(200).json({ ResultCode: 0, ResultDesc: "Accepted" });
-                    }
-                    duplicateMatches = String(receipt) === transaction.mpesa_receipt_number &&
-                        Number.isFinite(callbackAmount) &&
-                        Math.round(callbackAmount * 100) === Math.round(Number(transaction.amount) * 100) &&
+                    const receiptNumber = typeof receipt === "string" ? receipt.trim() : "";
+                    const callbackMatches = receiptNumber.length > 0 &&
+                        callbackAmountCents !== null &&
+                        callbackAmountCents === parseKesToCents(String(transaction.amount)) &&
                         normalizedPhone === transaction.phone_number;
+                    if (callbackMatches &&
+                        (!transaction.mpesa_receipt_number || transaction.mpesa_receipt_number.startsWith("RECON_"))) {
+                        const duplicateReceipt = await queryRunner.manager.findOne(MpesaTransaction, {
+                            where: { mpesa_receipt_number: receiptNumber },
+                        });
+                        if (!duplicateReceipt || duplicateReceipt.id === transaction.id) {
+                            transaction.mpesa_receipt_number = receiptNumber;
+                            transaction.callback_received = true;
+                            transaction.callback_data = callback;
+                            transaction.result_desc = typeof stkCallback.ResultDesc === "string"
+                                ? stkCallback.ResultDesc
+                                : transaction.result_desc;
+                            await queryRunner.manager.save(transaction);
+                            await queryRunner.commitTransaction();
+                            return res.status(200).json({ ResultCode: 0, ResultDesc: "Accepted" });
+                        }
+                    }
+                    duplicateMatches = callbackMatches && receiptNumber === transaction.mpesa_receipt_number;
                 } else if (transaction.status === "failed") {
                     duplicateMatches = getStkCallbackResultCode(transaction.callback_data) === resultCode;
                 }
@@ -959,7 +1016,7 @@ export class PaymentController {
             const receipt = metadata.find((item) => item.Name === "MpesaReceiptNumber")?.Value;
             const callbackAmount = metadata.find((item) => item.Name === "Amount")?.Value;
             const callbackPhone = metadata.find((item) => item.Name === "PhoneNumber")?.Value;
-            const parsedCallbackAmount = Number(callbackAmount);
+            const parsedCallbackAmountCents = callbackMoneyCents(callbackAmount);
             const normalizedCallbackPhone = normalizeMpesaPhone(callbackPhone);
 
             if (typeof receipt !== "string" || !receipt.trim()) {
@@ -976,9 +1033,10 @@ export class PaymentController {
             }
 
             const mismatchReasons: string[] = [];
-            if (!Number.isSafeInteger(parsedCallbackAmount) || parsedCallbackAmount <= 0 ||
-                parsedCallbackAmount !== Number(transaction.amount)) {
-                mismatchReasons.push(`Amount mismatch: expected KES ${transaction.amount}, received KES ${parsedCallbackAmount}`);
+            if (parsedCallbackAmountCents === null || parsedCallbackAmountCents <= 0n ||
+                parsedCallbackAmountCents % 100n !== 0n ||
+                parsedCallbackAmountCents !== parseKesToCents(String(transaction.amount))) {
+                mismatchReasons.push(`Amount mismatch: expected KES ${transaction.amount}, received KES ${parsedCallbackAmountCents === null ? String(callbackAmount) : centsToKesString(parsedCallbackAmountCents)}`);
             }
             if (!normalizedCallbackPhone || normalizedCallbackPhone !== transaction.phone_number) {
                 mismatchReasons.push(`Phone mismatch: expected ${transaction.phone_number}, received ${normalizedCallbackPhone || callbackPhone}`);
@@ -998,7 +1056,6 @@ export class PaymentController {
             transaction.mismatch_reason = null;
             transaction.callback_received = true;
             transaction.mpesa_receipt_number = receipt.trim();
-            transaction.amount = parsedCallbackAmount;
             await queryRunner.manager.save(transaction);
 
             if (transaction.sale_id) {
@@ -1007,10 +1064,17 @@ export class PaymentController {
                     lock: { mode: "pessimistic_write" },
                 });
                 if (sale) {
-                    sale.mpesa_amount = Number(sale.mpesa_amount || 0) + Number(transaction.amount);
-                    const totalPaid = Number(sale.cash_amount || 0) + sale.mpesa_amount + Number(sale.store_credit_amount || 0);
-                    sale.change_amount = Math.max(0, totalPaid - Number(sale.total_amount));
-                    sale.payment_status = totalPaid >= Number(sale.total_amount) ? "paid" : "partially_paid";
+                    const mpesaAmountCents = parseKesToCents(String(sale.mpesa_amount || 0)) +
+                        parseKesToCents(String(transaction.amount));
+                    const totalPaidCents = parseKesToCents(String(sale.cash_amount || 0)) +
+                        mpesaAmountCents +
+                        parseKesToCents(String(sale.store_credit_amount || 0));
+                    const totalAmountCents = parseKesToCents(String(sale.total_amount));
+                    sale.mpesa_amount = Number(centsToKesString(mpesaAmountCents));
+                    sale.change_amount = Number(centsToKesString(
+                        totalPaidCents > totalAmountCents ? totalPaidCents - totalAmountCents : 0n,
+                    ));
+                    sale.payment_status = totalPaidCents >= totalAmountCents ? "paid" : "partially_paid";
                     await queryRunner.manager.save(sale);
 
                     await AccountingService.recordMpesaReceivablePayment(
@@ -1269,6 +1333,18 @@ export class PaymentController {
                 await queryRunner.rollbackTransaction();
                 return res.status(400).json({ message: "Action must be mark_completed or mark_failed" });
             }
+            const resolutionNotes = typeof notes === "string" ? notes.trim() : "";
+            if (resolutionNotes.length < 5 || resolutionNotes.length > 500) {
+                await queryRunner.rollbackTransaction();
+                return res.status(400).json({ message: "Resolution notes must include the verification source (5–500 characters)" });
+            }
+            const receiptNumber = typeof req.body?.receipt_number === "string"
+                ? req.body.receipt_number.trim().toUpperCase()
+                : "";
+            if (action === "mark_completed" && !/^[A-Z0-9]{8,20}$/.test(receiptNumber)) {
+                await queryRunner.rollbackTransaction();
+                return res.status(400).json({ message: "A verified Safaricom receipt number is required to mark a payment completed" });
+            }
 
             const transaction = await queryRunner.manager.findOne(MpesaTransaction, {
                 where: { id: transactionId },
@@ -1286,8 +1362,17 @@ export class PaymentController {
             }
 
             if (action === "mark_completed") {
+                const duplicateReceipt = await queryRunner.manager.findOne(MpesaTransaction, {
+                    where: { mpesa_receipt_number: receiptNumber },
+                });
+                if (duplicateReceipt && duplicateReceipt.id !== transaction.id) {
+                    await queryRunner.rollbackTransaction();
+                    return res.status(409).json({ message: "M-Pesa receipt was already recorded against another transaction" });
+                }
                 transaction.status = "completed";
-                transaction.result_desc = notes ? `Admin resolved: ${notes}` : "Admin marked as completed";
+                transaction.mpesa_receipt_number = receiptNumber;
+                transaction.mismatch_reason = null;
+                transaction.result_desc = `Admin resolved after provider verification: ${resolutionNotes}`;
 
                 if (transaction.sale_id) {
                     const sale = await queryRunner.manager.findOne(Sale, {
@@ -1295,10 +1380,17 @@ export class PaymentController {
                         lock: { mode: "pessimistic_write" },
                     });
                     if (sale) {
-                        sale.mpesa_amount = Number(sale.mpesa_amount || 0) + Number(transaction.amount);
-                        const totalPaid = Number(sale.cash_amount || 0) + sale.mpesa_amount + Number(sale.store_credit_amount || 0);
-                        sale.change_amount = Math.max(0, totalPaid - Number(sale.total_amount));
-                        sale.payment_status = totalPaid >= Number(sale.total_amount) ? "paid" : "partially_paid";
+                        const mpesaAmountCents = parseKesToCents(String(sale.mpesa_amount || 0)) +
+                            parseKesToCents(String(transaction.amount));
+                        const totalPaidCents = parseKesToCents(String(sale.cash_amount || 0)) +
+                            mpesaAmountCents +
+                            parseKesToCents(String(sale.store_credit_amount || 0));
+                        const totalAmountCents = parseKesToCents(String(sale.total_amount));
+                        sale.mpesa_amount = Number(centsToKesString(mpesaAmountCents));
+                        sale.change_amount = Number(centsToKesString(
+                            totalPaidCents > totalAmountCents ? totalPaidCents - totalAmountCents : 0n,
+                        ));
+                        sale.payment_status = totalPaidCents >= totalAmountCents ? "paid" : "partially_paid";
                         await queryRunner.manager.save(sale);
 
                         await AccountingService.recordMpesaReceivablePayment(
@@ -1310,7 +1402,8 @@ export class PaymentController {
                 }
             } else {
                 transaction.status = "failed";
-                transaction.result_desc = notes ? `Admin rejected: ${notes}` : "Admin marked as failed";
+                transaction.mismatch_reason = resolutionNotes;
+                transaction.result_desc = `Admin resolved as failed after provider verification: ${resolutionNotes}`;
             }
 
             await queryRunner.manager.save(transaction);

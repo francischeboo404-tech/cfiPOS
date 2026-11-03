@@ -2,7 +2,7 @@
 
 ## Project Overview
 
-**cfi-POS** (developed by **cfi-POS Techiez Limited Company**) is an enterprise retail and wholesale point-of-sale system engineered for Kenyan retail businesses. It features M-Pesa payments (STK Push and C2B Paybill), KRA eTIMS tax fiscalization architecture, offline-first cashier tills, multi-warehouse inventory management, returns & refunds, store credit, shifts, and double-entry accounting.
+**cfi-POS** (developed by **cfi-POS Techiez Limited Company**) is an enterprise retail and wholesale point-of-sale system engineered for Kenyan retail businesses. It features M-Pesa payments (STK Push and C2B Paybill), a configurable eTIMS provider interface (live VSCU submission is disabled pending KRA test-environment verification), offline-first cashier tills, multi-warehouse inventory management, returns & refunds, store credit, shifts, and double-entry accounting.
 
 ## Key Features
 
@@ -10,14 +10,24 @@
 - 🔐 **4-Tier Role-Based Access Control** - Cashier, Supervisor, Manager, and Admin permissions
 - 📊 **Real-Time Dashboard & Observability** - Sales metrics, stock alerts, health probes, and structured logging
 - 🛒 **Point of Sale** - High-speed checkout, barcode scanning, cart parking, and stock reservations
+- 🏷️ **Timed Promotions** - EAT schedules, exact-cent discounts, quantity caps/quotas, immutable change history, and sale performance reporting
 - 💰 **Multiple Tender Channels** - Cash, M-Pesa STK Push, M-Pesa Paybill C2B, and Store Credit
 - 🔄 **Returns & Refunds Workflow** - Multi-item returns, manager approval, cash/M-Pesa/credit refunds, and sellable/damaged inventory triage
 - 📦 **Multi-Warehouse Logistics** - Inter-warehouse stock transfers, physical stock takes, and batch/expiry tracking
-- 🧾 **KRA eTIMS Architecture** - Pluggable tax compliance engine (`off`, `mock`, `live`) with scannable QR verification
+- 🧾 **eTIMS Provider Interface** - `off` and clearly labeled `mock` modes; live KRA fiscalization remains disabled until its integration is verified against the KRA test VSCU
 - 👥 **Customer & Receivables** - Customer CRM, B2B credit invoicing, receivables tracking, and loyalty rewards
-- 🏢 **Procurement & Payables** - Vendor records, purchase orders, 3-way matching goods receiving, and supplier invoices
+- 🏢 **Procurement & Payables** - Vendor records, purchase orders, 3-way matching goods receiving, manual physical-invoice entry for registered and new suppliers, review-gated payables, and invoice-linked payment history
 - ⚖️ **Double-Entry Accounting** - Automated balanced journal entries, chart of accounts, and financial reports
 - 🔄 **Offline-First Tills** - Provisional offline cash sales with IndexedDB queue and conflict resolution upon reconnect
+- 🧾 **Installment foundations** - Exact-cent plan/quote calculations, manager-configurable plans, Nairobi-date schedules, and expanded customer loyalty/installment visibility
+
+### Installment sales status
+
+Installment selling remains disabled until the full lifecycle, including sale and eTIMS handover, is implemented and validated. Administrators and managers can configure plan terms and global limits at **Installment Plans**. The backend provides plan management and a server-calculated quote endpoint; quotes use the existing timed-promotion pricing service, validate available stock including recorded reservations, and show exact KES amounts and a schedule. The authenticated `POST /api/installments/agreements` endpoint recalculates prices and terms server-side, enforces stock and customer credit limits, snapshots the agreement and schedule, reserves stock, and records an explicitly tendered deposit as a customer advance. Creation retries are idempotent. Quotes and agreement creation both reject products with an active timed promotion until promotion reservations can be reconciled with agreement handover/cancellation. The authenticated `POST /api/installments/payments` endpoint records a payment against an existing agreement, allocates exact cents oldest-first, applies idempotency, writes an audit event, and posts the receipt to the customer-advance liability account rather than recognizing sales revenue. Managers/admins can use `POST /api/installments/payments/:paymentId/reverse` to fully reverse an unhanded-over, uncancelled, non-written-off payment; the reversal copies the original principal/interest allocations and creates the exact opposite customer-advance journal posting. Reversal retries with the same reason are idempotent; a different reason conflicts. `POST /api/installments/agreements/:agreementId/cancel` cancels an agreement before handover, releases its exact stock reservations, refunds collected payments less the configured cancellation fee, and posts the configured fee to cancellation-fee revenue without a tax journal pending confirmation of tax treatment. Managers must attest with `refund_confirmed: true` that the refund has actually been paid; this endpoint records the selected tender and accounting entry but does not initiate a bank or M-Pesa transfer. Non-cash refunds require a reference number, which is retained in the cancellation record and protected against duplicate use per tender. Cancellation retries with matching reason, tender, and refund reference are idempotent. Refund tender, reference, and confirmation are audited. Non-cash payment tenders require a payment reference. Credit checks include interest and subtract the deposit; credit-limit settings are validated as exact integer cents. Minimum deposits round up to the next cent when needed; weekly/fortnightly flat-per-month terms use half-up rounding of plan months to hundredths. Schedule remainders are assigned to the final installment. Dates are computed from the agreement date in Africa/Nairobi.
+
+Customer profiles now support nullable national ID, alternative phone and address fields. The Customers screen exposes loyalty enrollment, voucher dates/status/points, installment summary columns, filters and CSV export. Existing customer-created vouchers continue to be issued automatically to preserve the pre-existing customer workflow; the migration backfills loyalty-enrolment provenance for existing vouchers.
+
+The agreement and payment endpoints remain blocked by the lifecycle fail-closed guard until stock release/handover through normal sale, inventory, invoice, accounting and eTIMS posting is complete. Payment reversals, cancellation/refunds, write-off, archive, reports and installment customer detail/checkout screens are also not yet implemented. Do not enable installment selling in production until those lifecycle controls are delivered. Interest VAT remains an accountant-confirmation setting and is not yet used by the payment/accounting lifecycle.
 
 ## Technologies Used
 
@@ -90,7 +100,6 @@ Server:
 - `PESAPAL_IPN_SECRET`: Provider-issued secret used to verify Pesapal IPN signatures
 - `GEMINI_API_KEY`: Required for AI inventory predictions
 - `AI_GATEWAY_URL`, `AI_MODEL`: AI-compatible chat endpoint and model identifier
-- `ETIMS_QR_VERIFY_URL`, `ETIMS_CREDIT_NOTE_QR_VERIFY_URL`: eTIMS receipt verification URL bases
 - `PESAPAL_MOCK_IFRAME_URL`: redirect base used by the Pesapal mock service
 
 Database encryption requires `ENCRYPTION_KEY` to be a 64-character hexadecimal value (32 bytes). The TypeORM backend supplies it as the PostgreSQL `app.encryption_key` session setting; never expose this value as a `VITE_` variable. The migration fails closed when the setting is absent. This is the only application database path required for the PostgreSQL-only deployment.
@@ -243,6 +252,8 @@ If users log in, verify OTP, but are immediately redirected back to the login sc
 5. Deploy from Vercel once. After that, Vercel automatically builds and deploys each push to the connected GitHub repository. Review Vercel's deployment status/checks on GitHub.
 
 The Vercel build deliberately fails with an actionable error if `VITE_API_URL` is missing, is not HTTPS (unless using relative `/api`), or does not end in `/api`. Vite embeds this public API URL at build time, so changing it requires a new deployment. Database credentials, `JWT_SECRET`, `ENCRYPTION_KEY`, and payment-provider secrets belong only on the API host and must never be added as `VITE_` variables. Deploy backend migrations on the API host using the existing TypeORM migration instructions before releasing backend updates.
+
+For Shape B, replace both `your-pos-api.onrender.com` rewrite destinations in `vercel.json` with the real HTTPS backend host before deploying. The Vercel build verifies that `/api` and `/socket.io` rewrites are present, use HTTPS, target a non-placeholder host, and share the same backend origin. Shape A uses the HTTPS API URL directly and does not rely on those rewrites for API or Socket.IO traffic.
 
 ### Paybill and checkout-reservation deployment
 

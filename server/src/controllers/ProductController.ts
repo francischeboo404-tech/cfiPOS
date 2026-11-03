@@ -11,6 +11,12 @@ import { PaymentCheckoutSession } from "../entity/PaymentCheckoutSession";
 import { InventoryService } from "../services/InventoryService";
 import { isConfiguredProductUnit, parseProductUnitOfMeasures } from "../services/ProductCatalogSettings";
 import { Setting } from "../entity/Setting";
+import { centsToKesString, parseKesToCents } from "../lib/exactMoney";
+import {
+    ETIMS_PRODUCT_MAPPING_FIELDS,
+    EtimsProductMappingValidationError,
+    sanitizeEtimsItemMapping,
+} from "../services/etims/EtimsItemMapping";
 
 const productRepository = AppDataSource.getRepository(Product);
 const categoryRepository = AppDataSource.getRepository(Category);
@@ -19,6 +25,7 @@ const warehouseRepository = AppDataSource.getRepository(Warehouse);
 const warehouseStockRepository = AppDataSource.getRepository(WarehouseStock);
 
 class ProductInventoryValidationError extends Error {}
+class ProductPriceValidationError extends Error {}
 
 const PRODUCT_IMPORT_TEMPLATE_HEADERS = [
     "sku",
@@ -166,6 +173,24 @@ export const parseProductImportNumber = (value: unknown): number => {
         .replace(/\s/g, "");
     const groupedNumber = /^-?\d{1,3}(?:,\d{3})+(?:\.\d+)?$/;
     return Number(groupedNumber.test(normalized) ? normalized.replace(/,/g, "") : normalized);
+};
+
+export const parseProductImportMoney = (value: unknown): string => {
+    const normalized = String(value ?? "")
+        .trim()
+        .replace(/^(?:KES|KSHS?|KSh)\s*/i, "")
+        .replace(/\s/g, "");
+    const groupedNumber = /^\d{1,3}(?:,\d{3})+(?:\.\d+)?$/;
+    let cents: bigint;
+    try {
+        cents = parseKesToCents(groupedNumber.test(normalized) ? normalized.replace(/,/g, "") : normalized);
+    } catch {
+        throw new ProductPriceValidationError("Amount must be non-negative with at most two decimal places.");
+    }
+    if (cents > 9_999_999_999n) {
+        throw new ProductPriceValidationError("Amount exceeds the maximum supported value of 99,999,999.99.");
+    }
+    return centsToKesString(cents);
 };
 
 export const selectProductImportWarehouse = <T extends { name: string; is_main: boolean }>(
@@ -367,6 +392,13 @@ const PRODUCT_ALLOWED_FIELDS = new Set([
     "name",
     "category_id",
     "tax_class_id",
+    "etims_item_code",
+    "etims_item_class_code",
+    "etims_product_type_code",
+    "etims_origin_country_code",
+    "etims_packaging_unit_code",
+    "etims_quantity_unit_code",
+    "etims_tax_type_code",
     "unit_cost",
     "retail_price",
     "tax_rate",
@@ -383,7 +415,8 @@ type ProductPayload = Partial<Pick<
     Product,
     "sku" | "barcode" | "name" | "unit_cost" | "retail_price" | "tax_class_id" | "tax_rate" |
     "unit_of_measure" | "reorder_level" | "stock_on_hand" | "location" | "parent_id" | "is_parent" |
-    "variant_attributes"
+    "variant_attributes" | "etims_item_code" | "etims_item_class_code" | "etims_product_type_code" |
+    "etims_origin_country_code" | "etims_packaging_unit_code" | "etims_quantity_unit_code" | "etims_tax_type_code"
 >> & { category_id?: string };
 
 export const sanitizeProductPayload = (input: unknown): ProductPayload => {
@@ -395,6 +428,21 @@ export const sanitizeProductPayload = (input: unknown): ProductPayload => {
 
     for (const [key, value] of Object.entries(input as Record<string, unknown>)) {
         if (!PRODUCT_ALLOWED_FIELDS.has(key) || value === undefined || value === null) {
+            continue;
+        }
+
+        if ((typeof value === "string" || typeof value === "number") &&
+            (key === "unit_cost" || key === "retail_price")) {
+            let amountCents: bigint;
+            try {
+                amountCents = parseKesToCents(String(value));
+            } catch {
+                throw new ProductPriceValidationError(`${key} must be a non-negative amount with at most two decimal places`);
+            }
+            if (amountCents > 9_999_999_999n) {
+                throw new ProductPriceValidationError(`${key} exceeds the maximum supported value of 99,999,999.99`);
+            }
+            sanitized[key] = Number(centsToKesString(amountCents));
             continue;
         }
 
@@ -414,8 +462,7 @@ export const sanitizeProductPayload = (input: unknown): ProductPayload => {
             if (!Number.isFinite(value)) {
                 continue;
             }
-            if (key === "unit_cost" || key === "retail_price" || key === "tax_rate" ||
-                key === "reorder_level" || key === "stock_on_hand") {
+            if (key === "tax_rate" || key === "reorder_level" || key === "stock_on_hand") {
                 sanitized[key] = value;
             }
             continue;
@@ -434,6 +481,9 @@ export const sanitizeProductPayload = (input: unknown): ProductPayload => {
         }
     }
 
+    if (ETIMS_PRODUCT_MAPPING_FIELDS.some((field) => field in input)) {
+        Object.assign(sanitized, sanitizeEtimsItemMapping(input as Record<string, unknown>));
+    }
     return sanitized;
 };
 
@@ -593,8 +643,22 @@ export class ProductController {
                         continue;
                     }
 
-                    const numericUnitCost = parseProductImportNumber(row.unit_cost);
-                    const numericRetailPrice = parseProductImportNumber(row.retail_price);
+                    let unitCost: string;
+                    let retailPrice: string;
+                    try {
+                        unitCost = parseProductImportMoney(row.unit_cost);
+                    } catch (error) {
+                        errors.push(`Row ${rowNumber}: unit_cost ${error instanceof Error ? error.message : "is invalid"}`);
+                        continue;
+                    }
+                    try {
+                        retailPrice = parseProductImportMoney(row.retail_price);
+                    } catch (error) {
+                        errors.push(`Row ${rowNumber}: retail_price ${error instanceof Error ? error.message : "is invalid"}`);
+                        continue;
+                    }
+                    const numericUnitCost = Number(unitCost);
+                    const numericRetailPrice = Number(retailPrice);
                     const rawNumericTaxRate = parseProductImportNumber(row.tax_rate ?? (taxClass ? taxClass.rate : 16));
                     const numericTaxRate = taxClass
                         ? Number(taxClass.rate)
@@ -921,7 +985,11 @@ export class ProductController {
             }
         } catch (error) {
             await queryRunner.rollbackTransaction();
-            if (error instanceof ProductInventoryValidationError) {
+            if (
+                error instanceof ProductInventoryValidationError ||
+                error instanceof ProductPriceValidationError ||
+                error instanceof EtimsProductMappingValidationError
+            ) {
                 return res.status(400).json({ message: error.message });
             }
             console.error(error);
@@ -958,7 +1026,11 @@ export class ProductController {
             res.json(results);
         } catch (error) {
             console.error(error);
-            res.status(500).json({ message: "Error updating product" });
+            const isClientError = error instanceof ProductPriceValidationError ||
+                error instanceof EtimsProductMappingValidationError;
+            res.status(isClientError ? 400 : 500).json({
+                message: isClientError ? error.message : "Error updating product",
+            });
         }
     }
 

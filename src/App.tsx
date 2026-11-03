@@ -43,6 +43,8 @@ const AccountsReceivable = lazy(() => import("./pages/AccountsReceivable"));
 const InventoryAdjustments = lazy(() => import("./pages/InventoryAdjustments"));
 const StockTakes = lazy(() => import("./pages/StockTakes"));
 const InventoryOperations = lazy(() => import("./pages/InventoryOperations"));
+const Promotions = lazy(() => import("./pages/Promotions"));
+const InstallmentPlans = lazy(() => import("./pages/InstallmentPlans"));
 
 const queryClient = new QueryClient();
 
@@ -191,6 +193,14 @@ const App = () => {
                                   }
                                 />
                                 <Route
+                                  path="/promotions"
+                                  element={
+                                    <ProtectedRoute allowedRoles={["admin", "manager"]}>
+                                      <Promotions />
+                                    </ProtectedRoute>
+                                  }
+                                />
+                                <Route
                                   path="/mobile-cashier"
                                   element={<MobileCashier />}
                                 />
@@ -250,6 +260,14 @@ const App = () => {
                                   element={
                                     <ProtectedRoute allowedRoles={["admin"]}>
                                       <Settings />
+                                    </ProtectedRoute>
+                                  }
+                                />
+                                <Route
+                                  path="/installment-plans"
+                                  element={
+                                    <ProtectedRoute allowedRoles={["admin", "manager"]}>
+                                      <InstallmentPlans />
                                     </ProtectedRoute>
                                   }
                                 />

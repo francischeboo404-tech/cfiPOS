@@ -15,6 +15,7 @@ import {
 } from "lucide-react";
 import { useAuth } from "@/hooks/useAuthContext";
 import { useToast } from "@/hooks/use-toast";
+import { formatKesCents, parseKesToCents } from "@/lib/exactMoney";
 import {
   Table,
   TableBody,
@@ -30,6 +31,22 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
+import {
+  Dialog,
+  DialogContent,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
+
+type EtimsMappingForm = {
+  etims_item_code: string;
+  etims_item_class_code: string;
+  etims_product_type_code: string;
+  etims_origin_country_code: string;
+  etims_packaging_unit_code: string;
+  etims_quantity_unit_code: string;
+  etims_tax_type_code: string;
+};
 
 interface Warehouse {
   id: string;
@@ -41,12 +58,19 @@ interface Product {
   sku: string;
   barcode: string | null;
   name: string;
-  unit_cost: number;
-  retail_price: number;
+  unit_cost: number | string;
+  retail_price: number | string;
   stock_on_hand: number;
   reorder_level: number;
   is_parent?: boolean;
   variant_attributes?: Record<string, string>;
+  etims_item_code: string | null;
+  etims_item_class_code: string | null;
+  etims_product_type_code: string | null;
+  etims_origin_country_code: string | null;
+  etims_packaging_unit_code: string | null;
+  etims_quantity_unit_code: string | null;
+  etims_tax_type_code: string | null;
 }
 
 interface ProductImportResponse {
@@ -60,6 +84,7 @@ interface ProductImportResponse {
 export default function Products() {
   const navigate = useNavigate();
   const { userRole } = useAuth();
+  const canManageCatalog = userRole === "admin" || userRole === "manager";
   const { toast } = useToast();
   const [products, setProducts] = useState<Product[]>([]);
   const [filteredProducts, setFilteredProducts] = useState<Product[]>([]);
@@ -70,6 +95,17 @@ export default function Products() {
   const [isImporting, setIsImporting] = useState(false);
   const [importErrors, setImportErrors] = useState<string[]>([]);
   const [importSummary, setImportSummary] = useState("");
+  const [mappingProduct, setMappingProduct] = useState<Product | null>(null);
+  const [etimsMappingForm, setEtimsMappingForm] = useState<EtimsMappingForm>({
+    etims_item_code: "",
+    etims_item_class_code: "",
+    etims_product_type_code: "",
+    etims_origin_country_code: "",
+    etims_packaging_unit_code: "",
+    etims_quantity_unit_code: "",
+    etims_tax_type_code: "",
+  });
+  const [savingEtimsMapping, setSavingEtimsMapping] = useState(false);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
 
   const loadWarehouses = useCallback(async () => {
@@ -98,8 +134,6 @@ export default function Products() {
         .filter((product) => !product.is_parent)
         .map((product) => ({
           ...product,
-          unit_cost: Number(product.unit_cost),
-          retail_price: Number(product.retail_price),
           stock_on_hand: Number(product.stock_on_hand),
           reorder_level: Number(product.reorder_level),
         }));
@@ -249,6 +283,38 @@ export default function Products() {
     }
   };
 
+  const openEtimsMappingEditor = (product: Product) => {
+    setMappingProduct(product);
+    setEtimsMappingForm({
+      etims_item_code: product.etims_item_code || "",
+      etims_item_class_code: product.etims_item_class_code || "",
+      etims_product_type_code: product.etims_product_type_code || "",
+      etims_origin_country_code: product.etims_origin_country_code || "",
+      etims_packaging_unit_code: product.etims_packaging_unit_code || "",
+      etims_quantity_unit_code: product.etims_quantity_unit_code || "",
+      etims_tax_type_code: product.etims_tax_type_code || "",
+    });
+  };
+
+  const saveEtimsMapping = async () => {
+    if (!mappingProduct || savingEtimsMapping) return;
+    setSavingEtimsMapping(true);
+    try {
+      await ApiService.put<Product>(`/products/${mappingProduct.id}`, etimsMappingForm);
+      toast({ title: "KRA item mapping saved" });
+      setMappingProduct(null);
+      await loadProducts(selectedWarehouse);
+    } catch (error) {
+      toast({
+        title: "Unable to save KRA item mapping",
+        description: error instanceof Error ? error.message : "Please verify the mapped values and try again.",
+        variant: "destructive",
+      });
+    } finally {
+      setSavingEtimsMapping(false);
+    }
+  };
+
   if (loading) {
     return (
       <div className="flex items-center justify-center h-full">
@@ -266,7 +332,7 @@ export default function Products() {
             Manage your product catalog
           </p>
         </div>
-        {userRole === "admin" && (
+        {canManageCatalog && (
           <div className="flex flex-wrap gap-2">
             <Button variant="outline" onClick={downloadImportTemplate}>
               <Download className="h-4 w-4 mr-2" />
@@ -371,13 +437,14 @@ export default function Products() {
                   Stock
                 </TableHead>
                 <TableHead className="text-xs sm:text-sm">Status</TableHead>
+                {canManageCatalog && <TableHead className="text-xs sm:text-sm">KRA eTIMS</TableHead>}
               </TableRow>
             </TableHeader>
             <TableBody>
               {filteredProducts.length === 0 && (
                 <TableRow>
                   <TableCell
-                    colSpan={7}
+                    colSpan={canManageCatalog ? 8 : 7}
                     className="py-8 text-center text-muted-foreground"
                   >
                     {selectedWarehouse === "all"
@@ -410,16 +477,14 @@ export default function Products() {
                       )}
                     </TableCell>
                     <TableCell className="text-right text-xs sm:text-sm">
-                      {product.unit_cost.toLocaleString("en-KE", {
-                        minimumFractionDigits: 0,
-                        maximumFractionDigits: 0,
-                      })}
+                      {formatKesCents(
+                        parseKesToCents(String(product.unit_cost)),
+                      )}
                     </TableCell>
                     <TableCell className="text-right text-xs sm:text-sm">
-                      {product.retail_price.toLocaleString("en-KE", {
-                        minimumFractionDigits: 0,
-                        maximumFractionDigits: 0,
-                      })}
+                      {formatKesCents(
+                        parseKesToCents(String(product.retail_price)),
+                      )}
                     </TableCell>
                     <TableCell className="text-right text-xs sm:text-sm">
                       {product.stock_on_hand}
@@ -436,6 +501,18 @@ export default function Products() {
                         </Badge>
                       )}
                     </TableCell>
+                    {canManageCatalog && (
+                      <TableCell>
+                        <Button
+                          type="button"
+                          variant="outline"
+                          size="sm"
+                          onClick={() => openEtimsMappingEditor(product)}
+                        >
+                          {product.etims_item_code ? "Edit mapping" : "Set mapping"}
+                        </Button>
+                      </TableCell>
+                    )}
                   </TableRow>
                 );
               })}
@@ -443,6 +520,120 @@ export default function Products() {
           </Table>
         </CardContent>
       </Card>
+      <Dialog
+        open={!!mappingProduct}
+        onOpenChange={(open) => {
+          if (!open && !savingEtimsMapping) setMappingProduct(null);
+        }}
+      >
+        <DialogContent className="max-h-[90vh] overflow-y-auto sm:max-w-2xl">
+          <DialogHeader>
+            <DialogTitle>KRA eTIMS Mapping — {mappingProduct?.name}</DialogTitle>
+          </DialogHeader>
+          <p className="text-sm text-muted-foreground">
+            Enter the codes confirmed for this item in KRA/VSCU. Values are not
+            inferred from POS tax rates or product units.
+          </p>
+          <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
+            <div className="space-y-2">
+              <label htmlFor="edit_etims_item_code" className="text-sm font-medium">KRA Item Code</label>
+              <Input
+                id="edit_etims_item_code"
+                maxLength={20}
+                value={etimsMappingForm.etims_item_code}
+                onChange={(event) => setEtimsMappingForm({ ...etimsMappingForm, etims_item_code: event.target.value })}
+              />
+            </div>
+            <div className="space-y-2">
+              <label htmlFor="edit_etims_item_class_code" className="text-sm font-medium">KRA Item Classification Code</label>
+              <Input
+                id="edit_etims_item_class_code"
+                maxLength={10}
+                value={etimsMappingForm.etims_item_class_code}
+                onChange={(event) => setEtimsMappingForm({ ...etimsMappingForm, etims_item_class_code: event.target.value })}
+              />
+            </div>
+            <div className="space-y-2">
+              <label htmlFor="edit_etims_product_type_code" className="text-sm font-medium">KRA Product Type</label>
+              <Select
+                value={etimsMappingForm.etims_product_type_code || "none"}
+                onValueChange={(value) => setEtimsMappingForm({
+                  ...etimsMappingForm,
+                  etims_product_type_code: value === "none" ? "" : value,
+                })}
+              >
+                <SelectTrigger id="edit_etims_product_type_code"><SelectValue placeholder="Select type" /></SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="none">Not mapped</SelectItem>
+                  <SelectItem value="1">1 - Raw material</SelectItem>
+                  <SelectItem value="2">2 - Finished product</SelectItem>
+                  <SelectItem value="3">3 - Service</SelectItem>
+                </SelectContent>
+              </Select>
+            </div>
+            <div className="space-y-2">
+              <label htmlFor="edit_etims_origin_country_code" className="text-sm font-medium">Country of Origin Code</label>
+              <Input
+                id="edit_etims_origin_country_code"
+                maxLength={5}
+                value={etimsMappingForm.etims_origin_country_code}
+                onChange={(event) => setEtimsMappingForm({ ...etimsMappingForm, etims_origin_country_code: event.target.value })}
+              />
+            </div>
+            <div className="space-y-2">
+              <label htmlFor="edit_etims_packaging_unit_code" className="text-sm font-medium">Packaging Unit Code</label>
+              <Input
+                id="edit_etims_packaging_unit_code"
+                maxLength={5}
+                value={etimsMappingForm.etims_packaging_unit_code}
+                onChange={(event) => setEtimsMappingForm({ ...etimsMappingForm, etims_packaging_unit_code: event.target.value })}
+              />
+            </div>
+            <div className="space-y-2">
+              <label htmlFor="edit_etims_quantity_unit_code" className="text-sm font-medium">Unit of Quantity Code</label>
+              <Input
+                id="edit_etims_quantity_unit_code"
+                maxLength={5}
+                value={etimsMappingForm.etims_quantity_unit_code}
+                onChange={(event) => setEtimsMappingForm({ ...etimsMappingForm, etims_quantity_unit_code: event.target.value })}
+              />
+            </div>
+            <div className="space-y-2">
+              <label htmlFor="edit_etims_tax_type_code" className="text-sm font-medium">KRA Tax Type</label>
+              <Select
+                value={etimsMappingForm.etims_tax_type_code || "none"}
+                onValueChange={(value) => setEtimsMappingForm({
+                  ...etimsMappingForm,
+                  etims_tax_type_code: value === "none" ? "" : value,
+                })}
+              >
+                <SelectTrigger id="edit_etims_tax_type_code"><SelectValue placeholder="Select tax type" /></SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="none">Not mapped</SelectItem>
+                  <SelectItem value="A">A - Exempt</SelectItem>
+                  <SelectItem value="B">B - 16%</SelectItem>
+                  <SelectItem value="C">C - Zero-rated</SelectItem>
+                  <SelectItem value="D">D - Non-VAT</SelectItem>
+                  <SelectItem value="E">E - 8%</SelectItem>
+                </SelectContent>
+              </Select>
+            </div>
+          </div>
+          <div className="flex justify-end gap-2">
+            <Button
+              type="button"
+              variant="outline"
+              disabled={savingEtimsMapping}
+              onClick={() => setMappingProduct(null)}
+            >
+              Cancel
+            </Button>
+            <Button type="button" disabled={savingEtimsMapping} onClick={() => void saveEtimsMapping()}>
+              {savingEtimsMapping ? "Saving..." : "Save mapping"}
+            </Button>
+          </div>
+        </DialogContent>
+      </Dialog>
     </div>
   );
 }

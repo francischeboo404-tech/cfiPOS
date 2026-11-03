@@ -22,6 +22,7 @@ import {
 } from "@/components/ui/dialog";
 import { format } from "date-fns";
 import { GRNInvoiceDownload } from "@/components/GRNInvoiceDownload";
+import { formatKesCents, parseKesToCents } from "@/lib/exactMoney";
 
 interface DeliveryNote {
   id: string;
@@ -31,7 +32,7 @@ interface DeliveryNote {
   delivery_date: string;
   status: string;
   total_items: number;
-  total_value: number;
+  total_value: number | string;
   notes: string | null;
   created_at: string;
   vendors: { name: string } | null;
@@ -45,8 +46,8 @@ interface DeliveryNoteItem {
   received_quantity: number;
   rejected_quantity: number;
   rejection_reason: string | null;
-  unit_cost: number;
-  line_total: number;
+  unit_cost: number | string;
+  line_total: number | string;
   products: { name: string; sku: string } | null;
 }
 
@@ -199,10 +200,7 @@ export default function DeliveryNotes() {
                     <TableCell>{note.vendors?.name || "N/A"}</TableCell>
                     <TableCell>{note.total_items}</TableCell>
                     <TableCell>
-                      KSh{" "}
-                      {note.total_value.toLocaleString("en-KE", {
-                        minimumFractionDigits: 2,
-                      })}
+                      {formatKesCents(parseKesToCents(String(note.total_value)))}
                     </TableCell>
                     <TableCell>
                       <Badge
@@ -299,16 +297,14 @@ export default function DeliveryNotes() {
                             : "-"}
                         </TableCell>
                         <TableCell className="text-right">
-                          KSh{" "}
-                          {item.unit_cost.toLocaleString("en-KE", {
-                            minimumFractionDigits: 2,
-                          })}
+                          {formatKesCents(
+                            parseKesToCents(String(item.unit_cost)),
+                          )}
                         </TableCell>
                         <TableCell className="text-right font-medium">
-                          KSh{" "}
-                          {item.line_total.toLocaleString("en-KE", {
-                            minimumFractionDigits: 2,
-                          })}
+                          {formatKesCents(
+                            parseKesToCents(String(item.line_total)),
+                          )}
                         </TableCell>
                       </TableRow>
                     ))}
@@ -320,10 +316,9 @@ export default function DeliveryNotes() {
                 <div>
                   <p className="text-sm text-muted-foreground">Total Value</p>
                   <p className="text-2xl font-bold">
-                    KSh{" "}
-                    {selectedNote.total_value.toLocaleString("en-KE", {
-                      minimumFractionDigits: 2,
-                    })}
+                    {formatKesCents(
+                      parseKesToCents(String(selectedNote.total_value)),
+                    )}
                   </p>
                 </div>
                 <div className="flex gap-2">

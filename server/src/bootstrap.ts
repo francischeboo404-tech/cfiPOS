@@ -1,9 +1,26 @@
 import "reflect-metadata";
+import { DataSource } from "typeorm";
 import { AppDataSource } from "./data-source";
 
 const confirmationRequired = "CREATE_SCHEMA_IN_EMPTY_DATABASE";
 const confirmation = process.env.POS_DB_BOOTSTRAP_CONFIRM;
 const databaseUrl = process.env.DATABASE_URL;
+const migrationManagedEntityTables = new Set([
+    "installment_plans",
+    "installment_agreements",
+    "installment_agreement_items",
+    "installment_schedules",
+    "installment_payments",
+    "installment_payment_allocations",
+    "installment_payment_reversals",
+    "installment_reversal_allocations",
+    "installment_stock_events",
+    "installment_handover_events",
+    "installment_cancellation_events",
+    "installment_write_off_events",
+    "installment_audit_events",
+    "loyalty_enrolments",
+]);
 
 const getDatabaseName = (connectionString: string): string => {
     try {
@@ -70,7 +87,21 @@ const bootstrapDatabase = async (): Promise<void> => {
         await queryRunner.query(`CREATE EXTENSION IF NOT EXISTS "pgcrypto"`);
 
         console.info(`Creating the current TypeORM entity baseline in empty database "${databaseName}".`);
-        await AppDataSource.synchronize(false);
+        const baselineEntities = AppDataSource.entityMetadatas
+            .filter(({ tableName }) => !migrationManagedEntityTables.has(tableName))
+            .map(({ target }) => target);
+        const baselineDataSource = new DataSource({
+            ...AppDataSource.options,
+            entities: baselineEntities,
+            migrations: [],
+            synchronize: false,
+        });
+        await baselineDataSource.initialize();
+        try {
+            await baselineDataSource.synchronize(false);
+        } finally {
+            await baselineDataSource.destroy();
+        }
         const appliedMigrations = await AppDataSource.runMigrations({ transaction: "all" });
         console.info(`Applied ${appliedMigrations.length} TypeORM migrations.`);
         console.info("POS database schema bootstrap completed.");

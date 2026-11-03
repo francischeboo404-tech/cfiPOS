@@ -11,6 +11,9 @@ import { Warehouse } from "../entity/Warehouse";
 import { InventoryService } from "../services/InventoryService";
 import { AccountingService } from "../services/AccountingService";
 import { EmailService } from "../services/EmailService";
+import { Purchase } from "../entity/Purchase";
+import { PurchaseItem } from "../entity/PurchaseItem";
+import { centsToKesString, parseKesToCents } from "../lib/exactMoney";
 
 class PurchaseOrderReceiveValidationError extends Error {}
 class PurchaseOrderCreateValidationError extends Error {}
@@ -38,16 +41,21 @@ export const sanitizePurchaseOrderCreatePayload = (input: unknown) => {
         const itemPayload = item as Record<string, unknown>;
         const product_id = typeof itemPayload.product_id === "string" ? itemPayload.product_id.trim() : "";
         const quantity = Number(itemPayload.quantity);
-        const unit_cost = Number(itemPayload.unit_cost);
+        const unit_cost = itemPayload.unit_cost;
 
         if (!product_id) throw new PurchaseOrderCreateValidationError("Each purchase-order item requires a product_id");
-        if (!Number.isInteger(quantity) || quantity <= 0) throw new PurchaseOrderCreateValidationError("Each purchase-order item quantity must be a positive whole number");
-        if (!Number.isFinite(unit_cost) || unit_cost < 0) throw new PurchaseOrderCreateValidationError("Each purchase-order item unit_cost must be a non-negative number");
+        if (!Number.isSafeInteger(quantity) || quantity <= 0) throw new PurchaseOrderCreateValidationError("Each purchase-order item quantity must be a positive whole number");
+        let unitCostCents: bigint;
+        try {
+            unitCostCents = parseKesToCents(String(unit_cost));
+        } catch {
+            throw new PurchaseOrderCreateValidationError("Each purchase-order item unit_cost must be a non-negative amount with at most two decimal places");
+        }
 
         return {
             product_id,
             quantity,
-            unit_cost: Number(unit_cost.toFixed(2)),
+            unit_cost: Number(centsToKesString(unitCostCents)),
         };
     });
 
@@ -76,6 +84,7 @@ export const sanitizePurchaseOrderReceivePayload = (input: unknown) => {
     }
 
     const payload = input as Record<string, unknown>;
+    const reference = typeof payload.reference === "string" ? payload.reference.trim().slice(0, 120) : "";
     if (!Array.isArray(payload.items) || payload.items.length === 0) {
         throw new PurchaseOrderReceiveValidationError("Receiving items are required");
     }
@@ -93,10 +102,10 @@ export const sanitizePurchaseOrderReceivePayload = (input: unknown) => {
 
         if (!po_item_id) throw new PurchaseOrderReceiveValidationError("Each receiving item requires a po_item_id");
         if (!product_id) throw new PurchaseOrderReceiveValidationError("Each receiving item requires a product_id");
-        if (!Number.isInteger(receiving_quantity) || receiving_quantity < 0) {
+        if (!Number.isSafeInteger(receiving_quantity) || receiving_quantity < 0) {
             throw new PurchaseOrderReceiveValidationError("Each receiving item receiving_quantity must be a non-negative whole number");
         }
-        if (!Number.isInteger(rejected_quantity) || rejected_quantity < 0) {
+        if (!Number.isSafeInteger(rejected_quantity) || rejected_quantity < 0) {
             throw new PurchaseOrderReceiveValidationError("Each receiving item rejected_quantity must be a non-negative whole number");
         }
 
@@ -135,6 +144,7 @@ export const sanitizePurchaseOrderReceivePayload = (input: unknown) => {
 
     return {
         items,
+        reference,
         notes: typeof payload.notes === "string" ? payload.notes.trim().slice(0, 500) : undefined,
     };
 };
@@ -180,10 +190,11 @@ export class PurchaseOrderController {
             }
 
             const { vendor_id, warehouse_id, items } = sanitizePurchaseOrderCreatePayload(req.body ?? {});
-            const calculatedTotal = items.reduce(
-                (sum, item) => sum + item.quantity * item.unit_cost,
-                0,
+            const calculatedTotalCents = items.reduce(
+                (sum, item) => sum + BigInt(item.quantity) * parseKesToCents(String(item.unit_cost)),
+                0n,
             );
+            const calculatedTotal = Number(centsToKesString(calculatedTotalCents));
             const poNumber = `PO-${Date.now()}`;
 
             const createdPurchaseOrder = await AppDataSource.transaction(async (manager) => {
@@ -321,7 +332,7 @@ export class PurchaseOrderController {
             await queryRunner.startTransaction();
 
             const id = req.params.id as string;
-            const { items: requestItems, notes } = sanitizePurchaseOrderReceivePayload(req.body ?? {});
+            const { items: requestItems, notes, reference } = sanitizePurchaseOrderReceivePayload(req.body ?? {});
             const receiverId = req.user?.id;
 
             const poRepo = queryRunner.manager.getRepository(PurchaseOrder);
@@ -375,8 +386,8 @@ export class PurchaseOrderController {
                 const cumulativeRequestedQuantity = (requestedQuantitiesByPoItem.get(requestItem.po_item_id) || 0) + requestedQuantity;
 
                 if (!poItem || poItem.product_id !== requestItem.product_id ||
-                    !Number.isInteger(receivingQuantity) || receivingQuantity < 0 ||
-                    !Number.isInteger(rejectedQuantity) || rejectedQuantity < 0 ||
+                    !Number.isSafeInteger(receivingQuantity) || receivingQuantity < 0 ||
+                    !Number.isSafeInteger(rejectedQuantity) || rejectedQuantity < 0 ||
                     cumulativeRequestedQuantity > remainingQuantity) {
                     throw new PurchaseOrderReceiveValidationError("Receiving quantities exceed the purchase order");
                 }
@@ -390,13 +401,18 @@ export class PurchaseOrderController {
                     receiving_quantity: receivingQuantity,
                     rejected_quantity: rejectedQuantity,
                     unit_cost: Number(poItem.unit_cost),
+                    unit_cost_cents: parseKesToCents(String(poItem.unit_cost)),
                 };
             });
 
             const totalItems = items.reduce((sum, item) => sum + item.receiving_quantity, 0);
             const totalHandledItems = items.reduce((sum, item) => sum + item.receiving_quantity + item.rejected_quantity, 0);
-            const totalValue = items.reduce((sum, item) => sum + item.receiving_quantity * item.unit_cost, 0);
-            
+            const totalValueCents = items.reduce(
+                (sum, item) => sum + BigInt(item.receiving_quantity) * item.unit_cost_cents,
+                0n,
+            );
+            const totalValue = Number(centsToKesString(totalValueCents));
+
             if (totalHandledItems === 0) {
                 await queryRunner.rollbackTransaction();
                 return res.status(400).json({ message: "No items to receive" });
@@ -415,6 +431,15 @@ export class PurchaseOrderController {
                 status: 'completed'
             });
             const savedDn = await dnRepo.save(newDn);
+            const purchase = await queryRunner.manager.save(Purchase, queryRunner.manager.create(Purchase, {
+                vendor_id: po.vendor_id,
+                warehouse_id: receivingWarehouse.id,
+                delivery_note_id: savedDn.id,
+                reference: reference || po.po_number,
+                purchase_kind: "receipt",
+                purchased_at: new Date(),
+                created_by: receiverId,
+            }));
 
             let fullyReceived = true;
             let atLeastOneReceived = false;
@@ -430,7 +455,9 @@ export class PurchaseOrderController {
                         rejected_quantity: requestItem.rejected_quantity,
                         rejection_reason: requestItem.rejection_reason,
                         unit_cost: requestItem.unit_cost,
-                        line_total: requestItem.receiving_quantity * requestItem.unit_cost,
+                        line_total: Number(centsToKesString(
+                            BigInt(requestItem.receiving_quantity) * requestItem.unit_cost_cents,
+                        )),
                         batch_number: requestItem.batch_number,
                         expiry_date: requestItem.expiry_date
                     });
@@ -452,14 +479,23 @@ export class PurchaseOrderController {
 
                     const product = await productRepo.findOne({ where: { id: requestItem.product_id } });
                     if (!product) throw new Error("Product not found while receiving purchase order");
+                    const unitCostCents = parseKesToCents(String(requestItem.unit_cost));
                     product.stock_on_hand = await InventoryService.receiveStock(
                         queryRunner.manager,
                         product.id,
                         receivingWarehouse.id,
                         requestItem.receiving_quantity,
-                        savedDn.id,
+                        purchase.id,
                         receiverId,
+                        unitCostCents,
                     );
+                    await queryRunner.manager.save(PurchaseItem, queryRunner.manager.create(PurchaseItem, {
+                        purchase_id: purchase.id,
+                        product_id: product.id,
+                        quantity: requestItem.receiving_quantity,
+                        unit_cost_cents: String(unitCostCents),
+                        total_cost_cents: String(unitCostCents * BigInt(requestItem.receiving_quantity)),
+                    }));
 
                     // Create ProductBatch for advanced tracking (FIFO)
                     const batch = batchRepo.create({
@@ -491,8 +527,8 @@ export class PurchaseOrderController {
                 }
             }
 
-            if (totalValue > 0) {
-                await AccountingService.recordInventoryReceipt(queryRunner.manager, po.id, totalValue);
+            if (totalValueCents > 0n) {
+                await AccountingService.recordInventoryReceipt(queryRunner.manager, po.id, totalValueCents);
             }
 
             if (fullyReceived) {

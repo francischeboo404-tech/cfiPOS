@@ -131,6 +131,27 @@ export class VendorController {
         }
     }
 
+    static async markVendorReviewed(req: AuthenticatedRequest, res: Response) {
+        try {
+            const vendorRepo = AppDataSource.getRepository(Vendor);
+            const vendor = await vendorRepo.findOne({ where: { id: req.params.id as string } });
+            if (!vendor) {
+                return res.status(404).json({ message: "Supplier not found" });
+            }
+            if (!req.user?.id) {
+                return res.status(401).json({ message: "Reviewer identity is required" });
+            }
+            vendor.needs_review = false;
+            vendor.reviewed_at = new Date();
+            vendor.reviewed_by = req.user.id;
+            await vendorRepo.save(vendor);
+            return res.json(vendor);
+        } catch (error) {
+            console.error("Error reviewing supplier:", error);
+            return res.status(500).json({ message: "Error reviewing supplier" });
+        }
+    }
+
     static async deleteVendor(req: Request, res: Response) {
         try {
             const id = req.params.id as string;

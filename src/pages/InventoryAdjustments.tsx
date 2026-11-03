@@ -54,7 +54,7 @@ export default function InventoryAdjustments() {
     reason: '',
   });
 
-  const isAdmin = role === 'admin';
+  const canManageAdjustments = role === 'admin' || role === 'manager' || role === 'supervisor';
 
   useEffect(() => {
     loadData();
@@ -117,7 +117,7 @@ export default function InventoryAdjustments() {
           <h1 className="text-3xl font-bold">Inventory Adjustments</h1>
           <p className="text-muted-foreground">Manage stock damages, shrinkage, and miscounts</p>
         </div>
-        {isAdmin && (
+        {canManageAdjustments && (
           <Dialog open={dialogOpen} onOpenChange={setDialogOpen}>
             <DialogTrigger asChild>
               <Button>

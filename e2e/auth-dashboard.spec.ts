@@ -90,6 +90,60 @@ test("cashier completes OTP login, sees dashboard data, and can log out", async 
   await expect(page.getByRole("button", { name: "Sign In" })).toBeVisible();
 });
 
+test("dashboard charts fit a narrow mobile viewport", async ({ page }) => {
+  await page.setViewportSize({ width: 320, height: 740 });
+  await page.addInitScript(() => {
+    localStorage.setItem("jwt_token", "e2e-session-token");
+  });
+
+  await page.route("**/api/**", async (route) => {
+    const { pathname } = new URL(route.request().url());
+
+    if (pathname.endsWith("/auth/me")) {
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({ id: "cashier-e2e", email: "cashier@example.test", role: "cashier" }),
+      });
+      return;
+    }
+
+    if (pathname.endsWith("/dashboard/stats")) {
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({
+          todaySales: 12500,
+          todayTransactions: 25,
+          lowStockCount: 2,
+          totalProducts: 128,
+          weeklyTrend: [{ day: "Mon", salesCents: "1250000", transactions: 25 }],
+          topProducts: [{ name: "Coffee", revenueCents: "1250000" }],
+          salesByMethod: [{ method: "Cash", amountCents: "1250000" }],
+          recentTransactions: [],
+          totalCustomers: 64,
+        }),
+      });
+      return;
+    }
+
+    await route.fulfill({ status: 200, contentType: "application/json", body: "[]" });
+  });
+
+  await page.goto("/dashboard", { waitUntil: "domcontentloaded" });
+  await expect(page.getByRole("heading", { name: "Dashboard" })).toBeVisible();
+
+  const charts = page.locator('[data-chart^="chart-"]');
+  await expect(charts).toHaveCount(3);
+  for (const chart of await charts.all()) {
+    const bounds = await chart.boundingBox();
+    expect(bounds).not.toBeNull();
+    expect(bounds!.x).toBeGreaterThanOrEqual(0);
+    expect(bounds!.x + bounds!.width).toBeLessThanOrEqual(320);
+  }
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
+});
+
 test("locations recover automatically after a temporary API outage", async ({ page }) => {
   let warehouseRequests = 0;
 
@@ -98,7 +152,8 @@ test("locations recover automatically after a temporary API outage", async ({ pa
   });
 
   await page.route("**/api/**", async (route) => {
-    const { pathname } = new URL(route.request().url());
+    const url = new URL(route.request().url());
+    const { pathname } = url;
 
     if (pathname.endsWith("/auth/me")) {
       await route.fulfill({
@@ -186,16 +241,26 @@ test("admin navigation stays on the left at desktop and works as a phone drawer"
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
 });
 
-test("mobile POS includes product tax and reuses its idempotency key after a failed checkout", async ({ page }) => {
+test("mobile POS uses the server promotion and tax total for confirmed cash checkout", async ({ page }) => {
   let checkoutAttempts = 0;
-  const checkoutPayloads: { cash_amount: number; idempotency_key: string }[] = [];
+  let reservationAttempts = 0;
+  let cashConfirmations = 0;
+  let reservationCancellations = 0;
+  const checkoutPayloads: {
+    cash_amount: string;
+    checkout_session_id: string;
+    idempotency_key: string;
+    warehouse_id: string;
+  }[] = [];
+  const warehouseProductQueries: string[] = [];
 
   await page.addInitScript(() => {
     localStorage.setItem("jwt_token", "e2e-cashier-token");
   });
 
   await page.route("**/api/**", async (route) => {
-    const { pathname } = new URL(route.request().url());
+    const url = new URL(route.request().url());
+    const { pathname } = url;
     if (pathname.endsWith("/auth/me")) {
       await route.fulfill({
         status: 200,
@@ -205,7 +270,17 @@ test("mobile POS includes product tax and reuses its idempotency key after a fai
       return;
     }
 
+    if (pathname.endsWith("/warehouses")) {
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify([{ id: "warehouse-mobile", name: "Mobile Branch", is_main: true }]),
+      });
+      return;
+    }
+
     if (pathname.endsWith("/products")) {
+      warehouseProductQueries.push(url.searchParams.get("warehouse_id") || "");
       await route.fulfill({
         status: 200,
         contentType: "application/json",
@@ -231,9 +306,53 @@ test("mobile POS includes product tax and reuses its idempotency key after a fai
       return;
     }
 
+    if (pathname.endsWith("/sales/checkouts") && route.request().method() === "POST") {
+      reservationAttempts += 1;
+      const reservation = route.request().postDataJSON() as {
+        checkout_session_id: string;
+        cash_amount: number;
+        items: Array<{ product_id: string; quantity: number }>;
+        warehouse_id: string;
+      };
+      await route.fulfill({
+        status: 201,
+        contentType: "application/json",
+        body: JSON.stringify({
+          id: reservation.checkout_session_id,
+          items: reservation.items,
+          warehouse_id: reservation.warehouse_id,
+          cash_amount: reservation.cash_amount,
+          total_amount: "92.80",
+          status: "reserved",
+        }),
+      });
+      return;
+    }
+
+    if (pathname.endsWith("/confirm-cash") && route.request().method() === "POST") {
+      cashConfirmations += 1;
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({ cash_amount: "92.80" }),
+      });
+      return;
+    }
+
+    if (pathname.endsWith("/cancel") && route.request().method() === "POST") {
+      reservationCancellations += 1;
+      await route.fulfill({ status: 200, contentType: "application/json", body: "{}" });
+      return;
+    }
+
     if (pathname.endsWith("/sales") && route.request().method() === "POST") {
       checkoutAttempts += 1;
-      checkoutPayloads.push(route.request().postDataJSON() as { cash_amount: number; idempotency_key: string });
+      checkoutPayloads.push(route.request().postDataJSON() as {
+        cash_amount: string;
+        checkout_session_id: string;
+        idempotency_key: string;
+        warehouse_id: string;
+      });
       await route.fulfill({
         status: checkoutAttempts <= 2 ? 503 : 201,
         contentType: "application/json",
@@ -251,8 +370,12 @@ test("mobile POS includes product tax and reuses its idempotency key after a fai
 
   await page.goto("/mobile-cashier", { waitUntil: "domcontentloaded" });
   await page.getByText("Taxable Mobile Product", { exact: true }).click();
-  const checkoutButton = page.getByRole("button", { name: "Complete Sale (1 items)" });
-  await expect(page.getByText("KSh 116.00")).toBeVisible();
+  const reviewButton = page.getByRole("button", { name: "Review Exact Total (1 items)" });
+  await reviewButton.click();
+  await expect(page.getByText("KES 92.80", { exact: true })).toBeVisible();
+  await expect(page.getByText("Exact total ready. Confirm the cash sale to continue.")).toBeVisible();
+  expect(checkoutAttempts).toBe(0);
+  const checkoutButton = page.getByRole("button", { name: "Confirm Cash Sale (1 items)" });
   await checkoutButton.click();
   await expect(page.getByText("Temporary checkout failure")).toBeVisible();
   await expect(checkoutButton).toBeEnabled();
@@ -264,14 +387,66 @@ test("mobile POS includes product tax and reuses its idempotency key after a fai
   expect(checkoutPayloads[1].idempotency_key).toBe(firstAttemptKey);
   await page.getByRole("button", { name: "Increase Taxable Mobile Product quantity" }).click();
   await page.getByRole("button", { name: "Decrease Taxable Mobile Product quantity" }).click();
-  await checkoutButton.click();
+  expect(reservationCancellations).toBeGreaterThan(0);
+  await page.getByRole("button", { name: "Review Exact Total (1 items)" }).click();
+  await page.getByRole("button", { name: "Confirm Cash Sale (1 items)" }).click();
   await expect(page.getByText("Sale completed!")).toBeVisible();
 
   expect(checkoutAttempts).toBe(3);
-  expect(checkoutPayloads[0].cash_amount).toBe(116);
+  expect(reservationAttempts).toBe(2);
+  expect(cashConfirmations).toBe(3);
   expect(firstAttemptKey).toBeTruthy();
-  expect(checkoutPayloads[2].cash_amount).toBe(116);
   expect(checkoutPayloads[2].idempotency_key).not.toBe(firstAttemptKey);
+  expect(checkoutPayloads[2].cash_amount).toBe("92.80");
+  expect(checkoutPayloads[2].checkout_session_id).toBeTruthy();
+  expect(warehouseProductQueries.length).toBeGreaterThan(0);
+  expect(warehouseProductQueries.every((warehouseId) => warehouseId === "warehouse-mobile")).toBe(true);
+  expect(checkoutPayloads[2].warehouse_id).toBe("warehouse-mobile");
+});
+
+test("mobile POS blocks sales when no active warehouse is available", async ({ page }) => {
+  let productRequests = 0;
+  let checkoutRequests = 0;
+
+  await page.addInitScript(() => {
+    localStorage.setItem("jwt_token", "e2e-cashier-token");
+  });
+
+  await page.route("**/api/**", async (route) => {
+    const { pathname } = new URL(route.request().url());
+    if (pathname.endsWith("/auth/me")) {
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({ id: "cashier-e2e", email: "cashier@example.test", role: "cashier" }),
+      });
+      return;
+    }
+
+    if (pathname.endsWith("/warehouses")) {
+      await route.fulfill({ status: 200, contentType: "application/json", body: "[]" });
+      return;
+    }
+
+    if (pathname.endsWith("/products")) {
+      productRequests += 1;
+      await route.fulfill({ status: 200, contentType: "application/json", body: "[]" });
+      return;
+    }
+
+    if (pathname.endsWith("/sales") && route.request().method() === "POST") {
+      checkoutRequests += 1;
+    }
+
+    await route.fulfill({ status: 200, contentType: "application/json", body: "[]" });
+  });
+
+  await page.goto("/mobile-cashier", { waitUntil: "domcontentloaded" });
+  await expect(
+    page.getByText("No active branch is available. Contact an administrator before making a sale."),
+  ).toBeVisible();
+  expect(productRequests).toBe(0);
+  expect(checkoutRequests).toBe(0);
 });
 
 test("sales refreshes stock for the selected warehouse after checkout", async ({ page }) => {

@@ -6,6 +6,8 @@ import * as jwt from "jsonwebtoken";
 import { strToU8, zipSync } from "fflate";
 import { TaxClass } from "../entity/TaxClass";
 import { Sale } from "../entity/Sale";
+import { SupplierPaymentMethod } from "../entity/SupplierPayment";
+import { assertSaleDiscountAuthorized } from "../lib/saleDiscountRules";
 import { verifyPesapalSignature } from "../lib/pesapal";
 import { sanitizeCategoryName } from "./CategoryController";
 import {
@@ -13,6 +15,7 @@ import {
   matchProductImportTaxClass,
   normalizeProductImportRow,
   parseProductImportFile,
+  parseProductImportMoney,
   parseProductImportNumber,
   sanitizeProductPayload,
   selectProductImportWarehouse,
@@ -21,20 +24,26 @@ import { getCompanyLogoMimeType, sanitizeSettingsPayload, sanitizeLoyaltyMemberP
 import { sanitizeCustomerPayload } from "./CustomerController";
 import { sanitizeVendorPayload } from "./VendorController";
 import { sanitizeWarehousePayload } from "./WarehouseController";
-import { sanitizeSupplierInvoicePayload, sanitizeSupplierPaymentPayload, sanitizeRequisitionStatusPayload } from "./ProcurementController";
+import {
+  isSameSupplierPaymentRequest,
+  sanitizeSupplierInvoicePayload,
+  sanitizeSupplierPaymentPayload,
+  sanitizeRequisitionStatusPayload,
+} from "./ProcurementController";
 import { sanitizeShiftCurrency } from "./ShiftController";
 import { sanitizeAuthRegistrationPayload, sanitizeAuthLoginPayload, sanitizeLogEventPayload } from "./AuthController";
 import { sanitizeInvoicePaymentPayload } from "./InvoiceController";
 import { sanitizeUserAdminUpdatePayload, sanitizeUserRolePayload, sanitizeUserCreatePayload } from "./UserAdminController";
 import { sanitizeInventoryAdjustmentPayload, sanitizeInventoryTransferPayload, sanitizeTransferStatusPayload, sanitizeStockTakePayload } from "./InventoryController";
 import { sanitizeReturnRequestPayload, sanitizeApproveReturnPayload, sanitizeRejectReturnPayload, sanitizeMpesaRefundReceipt } from "./ReturnController";
-import { calculateCashChange, deriveSalePaymentMethod, sanitizeSalePayload, sanitizeVoidSalePayload, sanitizeParkedSalePayload } from "./SalesController";
+import { calculateCashChange, calculateSaleItemCogsCents, deriveSalePaymentMethod, sanitizeSalePayload, sanitizeVoidSalePayload, sanitizeParkedSalePayload } from "./SalesController";
 import { sanitizePurchaseOrderCreatePayload, sanitizePurchaseOrderStatusPayload } from "./PurchaseOrderController";
 import { sanitizeTaxClassPayload, sanitizeTaxClassUpdatePayload } from "./TaxController";
 import {
   getMpesaStkConfigurationIssues,
   getMpesaStkTransactionType,
   hashMpesaCallbackToken,
+  parseC2bCallback,
   sanitizeMpesaStkPayload,
   verifyMpesaCallbackToken,
   verifyMpesaC2bCallbackToken,
@@ -42,8 +51,10 @@ import {
 import { escapeHtml, getOtpEmailConfigurationIssues, shouldUseDevOtpFallback } from "../services/EmailService";
 import { authenticateJWT, type AuthenticatedRequest } from "../middleware/auth";
 import { EtimsMockService, ETIMS_MOCK_DISCLAIMER } from "../services/EtimsMockService";
+import { EtimsService } from "../services/etims/EtimsService";
 import { PesapalMockService } from "../services/PesapalMockService";
 import { resolveAllowedCorsOrigins } from "../index";
+import { sanitizeCheckoutPayload } from "./CheckoutController";
 import { createInventoryPredictions, type DailySalesPoint } from "../services/InventoryPredictionService";
 import {
   DEFAULT_PRODUCT_UNIT_OF_MEASURES,
@@ -249,6 +260,45 @@ test("sanitizeProductPayload strips untrusted fields", () => {
     stock_on_hand: 5,
     is_parent: true,
   });
+});
+
+test("sanitizeProductPayload accepts explicit KRA item mappings and rejects unsupported codes", () => {
+  assert.deepEqual(
+    sanitizeProductPayload({
+      etims_item_code: " KE2NTU0000001 ",
+      etims_item_class_code: "5059690800",
+      etims_product_type_code: "2",
+      etims_origin_country_code: "KE",
+      etims_packaging_unit_code: "NT",
+      etims_quantity_unit_code: "U",
+      etims_tax_type_code: "B",
+    }),
+    {
+      etims_item_code: "KE2NTU0000001",
+      etims_item_class_code: "5059690800",
+      etims_product_type_code: "2",
+      etims_origin_country_code: "KE",
+      etims_packaging_unit_code: "NT",
+      etims_quantity_unit_code: "U",
+      etims_tax_type_code: "B",
+    },
+  );
+  assert.throws(
+    () => sanitizeProductPayload({ etims_tax_type_code: "16%" }),
+    /KRA tax type codes/,
+  );
+});
+
+test("product prices normalize exact cents and reject fractional cents or unsupported ranges", () => {
+  assert.deepEqual(
+    sanitizeProductPayload({ unit_cost: "0.29", retail_price: "99999999.99" }),
+    { unit_cost: 0.29, retail_price: 99_999_999.99 },
+  );
+  assert.throws(() => sanitizeProductPayload({ unit_cost: "1.005" }), /two decimal places/i);
+  assert.throws(() => sanitizeProductPayload({ retail_price: "100000000.00" }), /maximum supported value/i);
+  assert.equal(parseProductImportMoney("KSh 1,250.09"), "1250.09");
+  assert.throws(() => parseProductImportMoney("1,25.00"), /two decimal places/i);
+  assert.throws(() => parseProductImportMoney("-1.00"), /non-negative/i);
 });
 
 test("normalizeProductImportRow maps common spreadsheet columns to the internal product schema", () => {
@@ -502,6 +552,7 @@ test("sanitizeSettingsPayload only accepts supported keys", () => {
     mpesa_callback_url: "https://pos.example.test/api/webhooks/mpesa/callback",
     malicious_key: "should-not-save",
     receipt_footer: "Thanks!",
+    allow_negative_stock: true,
   };
 
   const result = sanitizeSettingsPayload(payload);
@@ -512,7 +563,9 @@ test("sanitizeSettingsPayload only accepts supported keys", () => {
     loyalty_points_rate: "2",
     mpesa_callback_url: "https://pos.example.test/api/webhooks/mpesa/callback",
     receipt_footer: "Thanks!",
+    allow_negative_stock: "true",
   });
+  assert.throws(() => sanitizeSettingsPayload({ allow_negative_stock: "yes" }), /true or false/i);
 });
 
 test("product catalog settings validate and persist configured units of measure", () => {
@@ -587,11 +640,22 @@ test("sales forecasts use exactly the supplied complete daily buckets and recent
   assert.equal(result.salesForecast.historyDays, 90);
   assert.equal(result.salesForecast.historicalTransactions, 90);
   assert.equal(result.salesForecast.activeSalesDays, 90);
-  assert.equal(result.salesForecast.baselineDailySales, 200);
-  assert.equal(result.salesForecast.next7Days, 1400);
-  assert.equal(result.salesForecast.next30Days, 6000);
+  assert.equal(result.salesForecast.baselineDailySales, "200.00");
+  assert.equal(result.salesForecast.next7Days, "1400.00");
+  assert.equal(result.salesForecast.next30Days, "6000.00");
   assert.equal(result.salesForecast.trendDirection, "increasing");
   assert.equal(result.salesForecast.confidence, "high");
+});
+
+test("sales forecasts sum and round daily revenue from exact cents", () => {
+  const result = createInventoryPredictions([], [
+    { date: "2026-01-01", total: "0.01", count: 1 },
+    { date: "2026-01-02", total: "0.00", count: 0 },
+  ]);
+
+  assert.equal(result.salesForecast.baselineDailySales, "0.01");
+  assert.equal(result.salesForecast.next7Days, "0.04");
+  assert.equal(result.salesForecast.next30Days, "0.15");
 });
 
 test("stock reorder recommendations match configured reorder levels, without arbitrary minimum quantities", () => {
@@ -612,7 +676,7 @@ test("stock reorder recommendations match configured reorder levels, without arb
     [["OUT", 10, "critical"], ["NONE", 0, "critical"], ["LOW", 3, "high"]],
   );
   assert.match(result.inventoryAlerts[1].reasoning, /no reorder level is configured/);
-  assert.equal(result.salesForecast.next7Days, 0);
+  assert.equal(result.salesForecast.next7Days, "0.00");
   assert.equal(result.salesForecast.trendDirection, "stable");
   assert.equal(result.salesForecast.confidence, "low");
 });
@@ -648,6 +712,8 @@ test("sanitizeVendorPayload strips untrusted fields", () => {
     email: "vendor@example.com",
     address: "Nairobi",
     payment_terms: "Net 30",
+    needs_review: false,
+    reviewed_by: "attacker-user",
     admin_override: "yes",
   };
 
@@ -688,9 +754,9 @@ test("sanitizeSupplierInvoicePayload strips untrusted fields", () => {
     vendor_id: "vendor-1",
     po_id: "po-1",
     delivery_note_id: "dn-1",
-    subtotal: 800,
-    tax_amount: 80,
-    total_amount: 880,
+    subtotal: "800.00",
+    tax_amount: "80.00",
+    total_amount: "880.00",
     notes: "Urgent",
     created_by: "attacker-user",
   };
@@ -702,38 +768,176 @@ test("sanitizeSupplierInvoicePayload strips untrusted fields", () => {
     vendor_id: "vendor-1",
     po_id: "po-1",
     delivery_note_id: "dn-1",
-    subtotal: 800,
-    tax_amount: 80,
-    total_amount: 880,
+    subtotal: "800.00",
+    tax_amount: "80.00",
+    total_amount: "880.00",
     notes: "Urgent",
   });
+  assert.throws(
+    () => sanitizeSupplierInvoicePayload({ subtotal: "1.005" }),
+    /two decimal places/i,
+  );
+});
+
+test("sanitizeSupplierInvoicePayload accepts supplier details for manual physical invoices", () => {
+  const result = sanitizeSupplierInvoicePayload({
+    invoice_number: " PHYS-100 ",
+    supplier_name: " Example Supplier ",
+    supplier_contact_person: " Jane Doe ",
+    supplier_phone: " +254700000000 ",
+    supplier_email: " jane@example.com ",
+    supplier_address: " Nairobi ",
+    invoice_date: "2026-10-01",
+    due_date: "2026-10-31",
+    subtotal: "100.00",
+    tax_amount: "16.00",
+    total_amount: "116.00",
+    needs_review: false,
+    status: "paid",
+  });
+
+  assert.deepEqual(result, {
+    invoice_number: "PHYS-100",
+    supplier_name: "Example Supplier",
+    supplier_contact_person: "Jane Doe",
+    supplier_phone: "+254700000000",
+    supplier_email: "jane@example.com",
+    supplier_address: "Nairobi",
+    invoice_date: "2026-10-01",
+    due_date: "2026-10-31",
+    subtotal: "100.00",
+    tax_amount: "16.00",
+    total_amount: "116.00",
+  });
+  assert.throws(
+    () => sanitizeSupplierInvoicePayload({
+      supplier_name: "Supplier",
+      invoice_date: "2026-02-30",
+    }),
+    /invoice_date.*YYYY-MM-DD/i,
+  );
+  assert.throws(
+    () => sanitizeSupplierInvoicePayload({
+      supplier_name: "x".repeat(201),
+    }),
+    /supplier_name is too long/i,
+  );
 });
 
 test("sanitizeSupplierPaymentPayload strips untrusted fields", () => {
+  const idempotencyKey = "00000000-0000-4000-8000-000000000001";
   const payload = {
     amount: 440,
     payment_method: "bank_transfer",
     reference_number: "REF-123",
     payment_date: "2026-10-01",
     notes: "Partial settlement",
+    idempotency_key: idempotencyKey,
     paid_by: "attacker-user",
   };
 
   const result = sanitizeSupplierPaymentPayload(payload);
 
   assert.deepEqual(result, {
-    amount: 440,
+    amount: "440.00",
     payment_method: "bank_transfer",
     reference_number: "REF-123",
     payment_date: "2026-10-01",
     notes: "Partial settlement",
+    idempotency_key: idempotencyKey,
   });
+  assert.throws(
+    () => sanitizeSupplierPaymentPayload({ amount: "1.005" }),
+    /two decimal places/i,
+  );
+  assert.throws(
+    () => sanitizeSupplierPaymentPayload({ amount: "0" }),
+    /greater than zero/i,
+  );
+  assert.throws(
+    () => sanitizeSupplierPaymentPayload({
+      amount: "10",
+      payment_method: "crypto",
+      idempotency_key: idempotencyKey,
+    }),
+    /payment_method/i,
+  );
+  assert.throws(
+    () => sanitizeSupplierPaymentPayload({
+      amount: "10",
+      payment_date: "2026-02-30",
+      idempotency_key: idempotencyKey,
+    }),
+    /YYYY-MM-DD/i,
+  );
+  assert.throws(
+    () => sanitizeSupplierPaymentPayload({
+      amount: "10",
+      payment_date: "2026-10-01T12:00:00Z",
+      idempotency_key: idempotencyKey,
+    }),
+    /YYYY-MM-DD/i,
+  );
+  assert.throws(
+    () => sanitizeSupplierPaymentPayload({
+      amount: "10",
+      notes: 10,
+      idempotency_key: idempotencyKey,
+    }),
+    /notes must be a string/i,
+  );
+  assert.throws(
+    () => sanitizeSupplierPaymentPayload({ amount: "10" }),
+    /idempotency_key/i,
+  );
+  assert.throws(
+    () => sanitizeSupplierPaymentPayload({ amount: "10", idempotency_key: "not-a-uuid" }),
+    /idempotency_key/i,
+  );
+  assert.equal(
+    sanitizeSupplierPaymentPayload({
+      amount: "12.34",
+      idempotency_key: "00000000-0000-4000-8000-000000000002",
+    }).amount,
+    "12.34",
+  );
+});
+
+test("supplier payment retries without an explicit date preserve the original effective date", () => {
+  const existingPayment = {
+    supplier_invoice_id: "invoice-1",
+    amount: "12.34",
+    payment_method: SupplierPaymentMethod.BANK_TRANSFER,
+    reference_number: null,
+    payment_date: new Date("2026-10-01T00:00:00.000Z"),
+    notes: null,
+  };
+  const retryWithoutDate = sanitizeSupplierPaymentPayload({
+    amount: "12.34",
+    idempotency_key: "00000000-0000-4000-8000-000000000003",
+  });
+  const retryWithSameDate = sanitizeSupplierPaymentPayload({
+    amount: "12.34",
+    payment_date: "2026-10-01",
+    idempotency_key: "00000000-0000-4000-8000-000000000004",
+  });
+  const retryWithDifferentDate = sanitizeSupplierPaymentPayload({
+    amount: "12.34",
+    payment_date: "2026-10-02",
+    idempotency_key: "00000000-0000-4000-8000-000000000005",
+  });
+
+  assert.equal(isSameSupplierPaymentRequest(existingPayment, "invoice-1", retryWithoutDate), true);
+  assert.equal(isSameSupplierPaymentRequest(existingPayment, "invoice-1", retryWithSameDate), true);
+  assert.equal(isSameSupplierPaymentRequest(existingPayment, "invoice-1", retryWithDifferentDate), false);
 });
 
 test("sanitizeShiftCurrency rejects negative and non-numeric values", () => {
-  assert.equal(sanitizeShiftCurrency(2500, "opening_float"), 2500);
+  assert.equal(sanitizeShiftCurrency(2500, "opening_float"), "2500.00");
+  assert.equal(sanitizeShiftCurrency("0.11", "actual_cash"), "0.11");
   assert.throws(() => sanitizeShiftCurrency(-5, "opening_float"), /non-negative number/);
   assert.throws(() => sanitizeShiftCurrency("abc", "actual_cash"), /non-negative number/);
+  assert.throws(() => sanitizeShiftCurrency("0.001", "actual_cash"), /two decimal places/);
 });
 
 test("sanitizeAuthRegistrationPayload normalizes and validates auth fields", () => {
@@ -813,7 +1017,7 @@ test("sanitizeInvoicePaymentPayload only accepts valid invoice payment fields", 
       admin_override: "yes",
     }),
     {
-      amount: 2500,
+      amount: "2500.00",
       payment_method: "mpesa",
       reference_number: "REF-42",
       mpesa_receipt: "MPESA-001",
@@ -822,6 +1026,13 @@ test("sanitizeInvoicePaymentPayload only accepts valid invoice payment fields", 
   );
 
   assert.throws(() => sanitizeInvoicePaymentPayload({ amount: -10, payment_method: "cash" }), /amount/i);
+  assert.throws(() => sanitizeInvoicePaymentPayload({ amount: "0.001", payment_method: "cash" }), /two decimal places/i);
+  assert.throws(() => sanitizeInvoicePaymentPayload({ amount: "1e3", payment_method: "cash" }), /two decimal places/i);
+  assert.throws(() => sanitizeInvoicePaymentPayload({ amount: 0, payment_method: "cash" }), /greater than zero/i);
+  assert.equal(
+    sanitizeInvoicePaymentPayload({ amount: "0.10", payment_method: "cash" }).amount,
+    "0.10",
+  );
   assert.throws(() => sanitizeInvoicePaymentPayload({ amount: 10, payment_method: "bitcoin" }), /payment_method/i);
 });
 
@@ -1033,7 +1244,93 @@ test("sanitizeSalePayload and sanitizeVoidSalePayload enforce trusted sale field
   });
 
   assert.throws(() => sanitizeSalePayload({ items: [{ product_id: "prod-1", quantity: 0 }], payment_method: "bitcoin" }), /payment_method|quantity/i);
+  assert.throws(
+    () => sanitizeSalePayload({
+      items: [{ product_id: "prod-1", quantity: Number.MAX_SAFE_INTEGER + 1 }],
+    }),
+    /positive safe whole number/i,
+  );
   assert.throws(() => sanitizeVoidSalePayload({ reason: ["bad"] }), /reason/i);
+});
+
+test("checkout payload quantities remain safe when duplicate products are combined", () => {
+  const basePayload = {
+    checkout_session_id: "550e8400-e29b-41d4-a716-446655440000",
+    items: [
+      { product_id: "prod-1", quantity: 2 },
+      { product_id: "prod-1", quantity: 3 },
+    ],
+  };
+
+  assert.deepEqual(sanitizeCheckoutPayload(basePayload).items, [
+    { product_id: "prod-1", quantity: 5 },
+  ]);
+  assert.throws(
+    () => sanitizeCheckoutPayload({
+      ...basePayload,
+      items: [{ product_id: "prod-1", quantity: Number.MAX_SAFE_INTEGER + 1 }],
+    }),
+    /positive safe whole-number quantity/i,
+  );
+  assert.throws(
+    () => sanitizeCheckoutPayload({
+      ...basePayload,
+      items: [
+        { product_id: "prod-1", quantity: Number.MAX_SAFE_INTEGER },
+        { product_id: "prod-1", quantity: 1 },
+      ],
+    }),
+    /combined checkout item quantity is too large/i,
+  );
+});
+
+test("checkout payment and discount amounts require exact supported KES values", () => {
+  const basePayload = {
+    checkout_session_id: "550e8400-e29b-41d4-a716-446655440000",
+    items: [{ product_id: "prod-1", quantity: 1 }],
+  };
+
+  assert.equal(
+    sanitizeCheckoutPayload({ ...basePayload, cash_amount: "10.20" }).cash_amount,
+    10.2,
+  );
+  assert.equal(
+    sanitizeCheckoutPayload({ ...basePayload, cash_amount: null }).cash_amount,
+    0,
+  );
+  assert.equal(
+    sanitizeCheckoutPayload({ ...basePayload, cash_amount: "99999999.99" }).cash_amount,
+    99999999.99,
+  );
+  for (const value of [true, "10.001", "1e3", "100000000.00"]) {
+    assert.throws(
+      () => sanitizeCheckoutPayload({ ...basePayload, cash_amount: value }),
+      /cash_amount/i,
+    );
+  }
+  assert.throws(
+    () => sanitizeCheckoutPayload({ ...basePayload, loyalty_discount: "0.001" }),
+    /loyalty_discount/i,
+  );
+  assert.throws(
+    () => sanitizeCheckoutPayload({ ...basePayload, store_credit_amount: "100000000.00" }),
+    /store_credit_amount/i,
+  );
+});
+
+test("manual sale discounts require manager or admin authorization", () => {
+  assert.equal(assertSaleDiscountAuthorized("cashier", 0), undefined);
+  assert.equal(assertSaleDiscountAuthorized("supervisor", 0), undefined);
+  assert.equal(assertSaleDiscountAuthorized("manager", 25), undefined);
+  assert.equal(assertSaleDiscountAuthorized("admin", 25), undefined);
+  assert.throws(
+    () => assertSaleDiscountAuthorized("cashier", 0.01),
+    /manager or admin authorization/i,
+  );
+  assert.throws(
+    () => assertSaleDiscountAuthorized("supervisor", 10),
+    /manager or admin authorization/i,
+  );
 });
 
 test("cash change is returned from tender and not counted as shift cash", () => {
@@ -1041,6 +1338,38 @@ test("cash change is returned from tender and not counted as shift cash", () => 
   assert.equal(calculateCashChange(80, 30, 0, 100), 10);
   assert.equal(calculateCashChange(80, 20, 0, 100), 0);
   assert.equal(calculateCashChange(40, 0, 0, 40), 0);
+  assert.equal(calculateCashChange(0.11, 0, 0, 0.1), 0.01);
+});
+
+test("sale void COGS fallback multiplies unit-cost cents without floating-point arithmetic", () => {
+  assert.equal(
+    calculateSaleItemCogsCents(
+      { cogs_total_cents: null, cogs_total: null, unit_cost: 0.29, quantity: 3 },
+      1.23,
+    ),
+    87n,
+  );
+  assert.equal(
+    calculateSaleItemCogsCents(
+      { cogs_total_cents: null, cogs_total: 0.86, unit_cost: 1, quantity: 3 },
+      1.23,
+    ),
+    86n,
+  );
+  assert.equal(
+    calculateSaleItemCogsCents(
+      { cogs_total_cents: "85", cogs_total: 0.86, unit_cost: 1, quantity: 3 },
+      1.23,
+    ),
+    85n,
+  );
+  assert.throws(
+    () => calculateSaleItemCogsCents(
+      { cogs_total_cents: null, cogs_total: null, unit_cost: 0.29, quantity: Number.MAX_SAFE_INTEGER + 1 },
+      undefined,
+    ),
+    /positive whole number/i,
+  );
 });
 
 test("sale payment method reflects all actual tender types", () => {
@@ -1191,6 +1520,30 @@ test("sanitizePurchaseOrderCreatePayload, sanitizePurchaseOrderStatusPayload and
   });
 
   assert.throws(() => sanitizePurchaseOrderCreatePayload({ vendor_id: "vend-1", warehouse_id: "warehouse-1", items: [{ product_id: "prod-1", quantity: 0, unit_cost: 10 }] }), /quantity/i);
+  assert.throws(
+    () => sanitizePurchaseOrderCreatePayload({
+      vendor_id: "vend-1",
+      warehouse_id: "warehouse-1",
+      items: [{ product_id: "prod-1", quantity: 9007199254740992, unit_cost: 10 }],
+    }),
+    /quantity/i,
+  );
+  assert.deepEqual(
+    sanitizePurchaseOrderCreatePayload({
+      vendor_id: "vend-1",
+      warehouse_id: "warehouse-1",
+      items: [{ product_id: "prod-1", quantity: 3, unit_cost: "1.05" }],
+    }).items,
+    [{ product_id: "prod-1", quantity: 3, unit_cost: 1.05 }],
+  );
+  assert.throws(
+    () => sanitizePurchaseOrderCreatePayload({
+      vendor_id: "vend-1",
+      warehouse_id: "warehouse-1",
+      items: [{ product_id: "prod-1", quantity: 1, unit_cost: "1.005" }],
+    }),
+    /two decimal places/i,
+  );
   assert.throws(() => sanitizePurchaseOrderStatusPayload({ status: "pirate" }), /status/i);
   assert.throws(() => sanitizeTaxClassPayload({ name: "", rate: 120, is_default: false }), /name|rate/i);
   assert.throws(() => sanitizeTaxClassUpdatePayload({ name: "", rate: 110 }), /name|rate/i);
@@ -1212,9 +1565,9 @@ test("sanitizeMpesaStkPayload rejects unsafe values and normalizes valid ones", 
       amount: 2500,
       checkout_session_id: "550e8400-e29b-41d4-a716-446655440000",
       items: [{ product_id: "prod-1", quantity: 2 }],
-      loyalty_discount: 0,
-      cash_amount: 10,
-      store_credit_amount: 0,
+      loyaltyDiscountCents: 0n,
+      cashAmountCents: 1000n,
+      storeCreditAmountCents: 0n,
       warehouse_id: undefined,
       account_reference: "Ref-42",
     }
@@ -1229,8 +1582,17 @@ test("sanitizeMpesaStkPayload rejects unsafe values and normalizes valid ones", 
   assert.throws(() => sanitizeMpesaStkPayload({ ...validCheckout, phone_number: "bad" }), /phone_number/i);
   assert.throws(() => sanitizeMpesaStkPayload({ ...validCheckout, amount: "-10" }), /amount/i);
   assert.throws(() => sanitizeMpesaStkPayload({ ...validCheckout, amount: 100.5 }), /whole number/i);
+  assert.throws(() => sanitizeMpesaStkPayload({ ...validCheckout, cash_amount: "10.001" }), /two decimal places/i);
+  assert.equal(
+    sanitizeMpesaStkPayload({ ...validCheckout, cash_amount: "10.29", store_credit_amount: "0.01" }).cashAmountCents,
+    1029n,
+  );
+  assert.equal(
+    sanitizeMpesaStkPayload({ ...validCheckout, cash_amount: "10.29", store_credit_amount: "0.01" }).storeCreditAmountCents,
+    1n,
+  );
   assert.throws(() => sanitizeMpesaStkPayload({ ...validCheckout, checkout_session_id: "invalid" }), /checkout_session_id/i);
-  assert.throws(() => sanitizeMpesaStkPayload({ ...validCheckout, items: [] }), /items/i);
+  assert.deepEqual(sanitizeMpesaStkPayload({ ...validCheckout, items: [] }).items, []);
   assert.equal(
     sanitizeMpesaStkPayload({ ...validCheckout, store_credit_barcode: " SC-123 " }).store_credit_barcode,
     "SC-123",
@@ -1239,6 +1601,19 @@ test("sanitizeMpesaStkPayload rejects unsafe values and normalizes valid ones", 
     () => sanitizeMpesaStkPayload({ ...validCheckout, store_credit_barcode: "X".repeat(21) }),
     /store_credit_barcode/i,
   );
+});
+
+test("parseC2bCallback preserves exact cents and rejects fractional-cent amounts", () => {
+  const callback = {
+    TransID: "ABC1234567",
+    TransAmount: "100.25",
+    BusinessShortCode: "123456",
+    BillRefNumber: "POS12345678",
+    MSISDN: "254712345678",
+  };
+  assert.equal(parseC2bCallback(callback)?.amountCents, 10025n);
+  assert.equal(parseC2bCallback({ ...callback, TransAmount: "100.001" }), null);
+  assert.equal(parseC2bCallback({ ...callback, TransAmount: "9007199254740993" })?.amountCents, 900719925474099300n);
 });
 
 test("WebSocket and JWT authentication reject unverified OTP 2FA challenge tokens", () => {
@@ -1359,14 +1734,26 @@ test("authenticateJWT middleware explicitly returns 401 when token has is_otp_ph
 });
 
 test("EtimsMockService signs invoices with prominent test disclaimers and test prefixes", async () => {
-  const dummySale = Object.assign(new Sale(), { id: "test-sale-123" });
-  const result = await EtimsMockService.signInvoice(dummySale);
+  const originalEtimsMode = process.env.ETIMS_MODE;
+  process.env.ETIMS_MODE = "mock";
+  EtimsService.resetProvider();
+  try {
+    const dummySale = Object.assign(new Sale(), { id: "test-sale-123" });
+    const result = await EtimsMockService.signInvoice(dummySale);
 
-  assert.equal(result.is_mock, true);
-  assert.equal(result.disclaimer, ETIMS_MOCK_DISCLAIMER);
-  assert.equal(result.receipt_no.startsWith("TEST-ETIMS-"), true);
-  assert.equal(result.signature.startsWith("TEST-SIG-"), true);
-  assert.equal(result.qr_code.includes("mock=true"), true);
+    assert.equal(result.is_mock, true);
+    assert.equal(result.disclaimer, ETIMS_MOCK_DISCLAIMER);
+    assert.equal(result.receipt_no.startsWith("TEST-ETIMS-"), true);
+    assert.equal(result.signature.startsWith("TEST-SIG-"), true);
+    assert.equal(result.qr_code.includes("mock=true"), true);
+  } finally {
+    if (originalEtimsMode === undefined) {
+      delete process.env.ETIMS_MODE;
+    } else {
+      process.env.ETIMS_MODE = originalEtimsMode;
+    }
+    EtimsService.resetProvider();
+  }
 });
 
 test("PesapalMockService prefixes mock tracking IDs and identifies mock state", async () => {

@@ -15,13 +15,14 @@ import {
   TableHeader,
   TableRow,
 } from "@/components/ui/table";
+import { formatKesCents, parseKesToCents } from "@/lib/exactMoney";
 
 interface PurchaseOrder {
   id: string;
   po_number: string;
   vendor_id: string;
   status: string;
-  total_amount: number;
+  total_amount: number | string;
   created_at: string;
   warehouse?: { name: string } | null;
   vendors?: { name: string } | null;
@@ -184,10 +185,9 @@ export default function PurchaseOrders() {
                       </Badge>
                     </TableCell>
                     <TableCell>
-                      KSh{" "}
-                      {order.total_amount.toLocaleString("en-KE", {
-                        minimumFractionDigits: 2,
-                      })}
+                      {formatKesCents(
+                        parseKesToCents(String(order.total_amount)),
+                      )}
                     </TableCell>
                     <TableCell>
                       {new Date(order.created_at).toLocaleDateString("en-KE")}

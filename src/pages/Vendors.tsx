@@ -3,9 +3,10 @@ import { ApiService } from "@/lib/api";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { Badge } from "@/components/ui/badge";
 import { Label } from "@/components/ui/label";
 import { Textarea } from "@/components/ui/textarea";
-import { Plus, Edit, Trash2 } from "lucide-react";
+import { Plus, Edit, Trash2, Check } from "lucide-react";
 import { toast } from "sonner";
 import { useAuth } from "@/hooks/useAuthContext";
 import {
@@ -39,6 +40,7 @@ interface Vendor {
   email: string | null;
   address: string | null;
   payment_terms: string | null;
+  needs_review: boolean;
 }
 
 export default function Vendors() {
@@ -125,7 +127,18 @@ export default function Vendors() {
     setVendorToDelete(null);
   };
 
+  const handleReviewSupplier = async (vendor: Vendor) => {
+    try {
+      await ApiService.post(`/vendors/${vendor.id}/review`, {});
+      toast.success("Supplier record reviewed");
+      await loadVendors();
+    } catch (error) {
+      toast.error(error.message || "Failed to review supplier");
+    }
+  };
+
   const isAdmin = role === "admin";
+  const canReviewSuppliers = role === "admin" || role === "manager";
 
   const tabItems = [
     { value: "vendors", label: "Suppliers" },
@@ -287,9 +300,25 @@ export default function Vendors() {
                   <Card key={vendor.id}>
                     <CardHeader>
                       <CardTitle className="flex justify-between items-start">
-                        <span>{vendor.name}</span>
-                        {isAdmin && (
-                          <div className="flex gap-1">
+                        <div className="flex flex-col gap-2">
+                          <span>{vendor.name}</span>
+                          {vendor.needs_review && (
+                            <Badge variant="destructive" className="w-fit">Review needed</Badge>
+                          )}
+                        </div>
+                        <div className="flex gap-1">
+                          {vendor.needs_review && canReviewSuppliers && (
+                            <Button
+                              variant="outline"
+                              size="sm"
+                              onClick={() => handleReviewSupplier(vendor)}
+                            >
+                              <Check className="h-4 w-4 mr-1" />
+                              Mark reviewed
+                            </Button>
+                          )}
+                          {isAdmin && (
+                            <>
                             <Button
                               variant="ghost"
                               size="icon"
@@ -304,8 +333,9 @@ export default function Vendors() {
                             >
                               <Trash2 className="h-4 w-4 text-destructive" />
                             </Button>
-                          </div>
-                        )}
+                            </>
+                          )}
+                        </div>
                       </CardTitle>
                     </CardHeader>
                     <CardContent className="space-y-2 text-sm">

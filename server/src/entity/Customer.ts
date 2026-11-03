@@ -1,7 +1,8 @@
-import { Entity, PrimaryGeneratedColumn, Column, CreateDateColumn, UpdateDateColumn, OneToMany } from "typeorm";
+import { Entity, PrimaryGeneratedColumn, Column, CreateDateColumn, UpdateDateColumn, OneToMany, Index } from "typeorm";
 import { Sale } from "./Sale";
 
 @Entity("customers")
+@Index("UQ_customers_phone_installment", ["phone"], { unique: true })
 export class Customer {
     @PrimaryGeneratedColumn("uuid")
     id: string;
@@ -14,6 +15,15 @@ export class Customer {
 
     @Column({ nullable: true })
     email: string;
+
+    @Column({ type: "varchar", length: 64, nullable: true })
+    national_id: string | null;
+
+    @Column({ type: "varchar", length: 32, nullable: true })
+    alternative_phone: string | null;
+
+    @Column({ type: "text", nullable: true })
+    address: string | null;
 
     @Column("decimal", { precision: 10, scale: 2, default: 0 })
     total_purchases: number;

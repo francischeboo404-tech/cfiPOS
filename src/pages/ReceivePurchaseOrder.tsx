@@ -10,6 +10,7 @@ import { toast } from "sonner";
 import { ArrowLeft, Package, AlertTriangle } from "lucide-react";
 import { useAuth } from "@/hooks/useAuthContext";
 import { Badge } from "@/components/ui/badge";
+import { formatKesCents, parseKesToCents } from "@/lib/exactMoney";
 
 interface POItem {
   id: string;
@@ -57,6 +58,7 @@ export default function ReceivePurchaseOrder() {
   const [loading, setLoading] = useState(false);
   const [po, setPO] = useState<PurchaseOrder | null>(null);
   const [items, setItems] = useState<ReceiveItem[]>([]);
+  const [reference, setReference] = useState("");
   const [notes, setNotes] = useState("");
 
   const loadPO = useCallback(async () => {
@@ -68,6 +70,7 @@ export default function ReceivePurchaseOrder() {
       );
       if (data) {
         setPO(data);
+        setReference((current) => current || data.po_number);
 
         const receiveItems: ReceiveItem[] = data.items.map((item) => ({
           id: item.id,
@@ -104,6 +107,10 @@ export default function ReceivePurchaseOrder() {
   }, [loadPO, navigate, role]);
 
   const updateReceivingQuantity = (itemId: string, value: number) => {
+    if (!Number.isSafeInteger(value) || value < 0) {
+      toast.error("Receiving quantity must be a non-negative whole number");
+      return;
+    }
     setItems(
       items.map((item) =>
         item.id === itemId
@@ -121,6 +128,21 @@ export default function ReceivePurchaseOrder() {
           : item,
       ),
     );
+  };
+
+  const calculateReceivingLineCents = (item: ReceiveItem): bigint | null => {
+    try {
+      return BigInt(item.receiving_quantity) *
+        BigInt(parseKesToCents(String(item.unit_cost)));
+    } catch {
+      return null;
+    }
+  };
+
+  const calculateReceivingTotalCents = (): bigint | null => {
+    const lineValues = items.map(calculateReceivingLineCents);
+    if (lineValues.some((value) => value === null)) return null;
+    return lineValues.reduce((sum, value) => sum + (value ?? 0n), 0n);
   };
 
   const updateItemField = <K extends keyof ReceiveItem,>(
@@ -149,6 +171,7 @@ export default function ReceivePurchaseOrder() {
     try {
       const payload = {
         user_id: user.id,
+        reference,
         notes: notes,
         items: items.map((item) => ({
           po_item_id: item.id,
@@ -267,7 +290,7 @@ export default function ReceivePurchaseOrder() {
                       onChange={(e) =>
                         updateReceivingQuantity(
                           item.id,
-                          parseInt(e.target.value) || 0,
+                          e.target.value === "" ? 0 : Number(e.target.value),
                         )
                       }
                       className="text-lg font-semibold"
@@ -347,7 +370,13 @@ export default function ReceivePurchaseOrder() {
                   <div className="space-y-2 md:col-span-1 lg:col-span-2">
                     <Label>Line Total</Label>
                     <Input
-                      value={`KSh ${(item.receiving_quantity * item.unit_cost).toLocaleString("en-KE", { minimumFractionDigits: 2 })}`}
+                      value={
+                        calculateReceivingLineCents(item) === null
+                          ? "Invalid amount"
+                          : formatKesCents(
+                              calculateReceivingLineCents(item) ?? 0n,
+                            )
+                      }
                       disabled
                     />
                   </div>
@@ -392,6 +421,17 @@ export default function ReceivePurchaseOrder() {
           })}
 
           <div className="space-y-2">
+            <Label htmlFor="purchase-reference">Supplier Invoice / Reference</Label>
+            <Input
+              id="purchase-reference"
+              value={reference}
+              onChange={(event) => setReference(event.target.value)}
+              maxLength={120}
+              placeholder={`Default: ${po.po_number}`}
+            />
+          </div>
+
+          <div className="space-y-2">
             <Label htmlFor="notes">Delivery Notes</Label>
             <Textarea
               id="notes"
@@ -408,14 +448,9 @@ export default function ReceivePurchaseOrder() {
                 Total Receiving Value
               </p>
               <p className="text-2xl font-bold">
-                KSh{" "}
-                {items
-                  .reduce(
-                    (sum, item) =>
-                      sum + item.receiving_quantity * item.unit_cost,
-                    0,
-                  )
-                  .toLocaleString("en-KE", { minimumFractionDigits: 2 })}
+                {calculateReceivingTotalCents() === null
+                  ? "Invalid amount"
+                  : formatKesCents(calculateReceivingTotalCents() ?? 0n)}
               </p>
             </div>
             <div className="flex gap-2">

@@ -26,16 +26,16 @@ export class SupplierInvoice {
     @Column()
     vendor_id: string;
 
-    @ManyToOne(() => PurchaseOrder)
+    @ManyToOne(() => PurchaseOrder, { nullable: true })
     @JoinColumn({ name: "po_id" })
-    purchase_order: PurchaseOrder;
+    purchase_order: PurchaseOrder | null;
 
-    @Column()
-    po_id: string;
+    @Column({ nullable: true, type: "uuid" })
+    po_id: string | null;
 
-    @ManyToOne(() => DeliveryNote)
+    @ManyToOne(() => DeliveryNote, { nullable: true })
     @JoinColumn({ name: "delivery_note_id" })
-    delivery_note: DeliveryNote;
+    delivery_note: DeliveryNote | null;
 
     @Column({ type: "uuid", nullable: true })
     delivery_note_id: string | null;
@@ -66,6 +66,12 @@ export class SupplierInvoice {
 
     @Column({ type: "uuid", nullable: true })
     created_by: string | null;
+
+    @Column({ type: "timestamptz", nullable: true })
+    manual_reviewed_at: Date | null;
+
+    @Column({ type: "uuid", nullable: true })
+    manual_reviewed_by: string | null;
 
     @Column({
         type: "enum",

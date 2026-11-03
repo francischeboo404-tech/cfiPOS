@@ -25,6 +25,8 @@ interface IntegrationApiObject {
     storeCreditBarcode: string;
     mpesaRefundPending: boolean;
     quantity: number;
+    returnable_quantity: number;
+    approved_returned_quantity: number;
     quantity_before: number;
     quantity_after: number;
     total_amount: number;
@@ -32,7 +34,7 @@ interface IntegrationApiObject {
     amount: number;
     ResultCode: number;
     predictions: {
-        salesForecast: { historyDays: number; next7Days: number };
+        salesForecast: { historyDays: number; next7Days: string };
         inventoryAlerts: unknown[];
         recommendations: unknown[];
     };
@@ -50,7 +52,12 @@ interface IntegrationApiObject {
     store_credit_voucher: { barcode: string; current_balance: number };
     po: { status: string };
     invoice_number: string;
-    payment: { id: string };
+    payment: { id: string; payment_date: string };
+    payer: { id: string };
+    vendor_id: string | null;
+    po_id: string | null;
+    manual_reviewed_at: string | null;
+    manual_reviewed_by: string | null;
     errors: string[];
     user: { email: string; role: string };
     profile: { full_name: string };
@@ -73,8 +80,8 @@ interface IntegrationApiObject {
     paybill_c2b_enabled: boolean;
     transaction_id: string;
     account_reference: string;
-    expected_cash: number;
-    mpesa_total: number;
+    expected_cash: string;
+    mpesa_total: string;
     received_quantity: number;
     created: number;
     skipped: number;
@@ -111,14 +118,18 @@ const { OtpCode } = loadModule("../entity/OtpCode") as typeof import("../entity/
 const { MpesaTransaction } = loadModule("../entity/MpesaTransaction") as typeof import("../entity/MpesaTransaction");
 const { Setting } = loadModule("../entity/Setting") as typeof import("../entity/Setting");
 const { hashMpesaCallbackToken } = loadModule("../controllers/PaymentController") as typeof import("../controllers/PaymentController");
+const { allocateWeightedAverageCogs, centsToKesString } = loadModule("../lib/exactMoney") as typeof import("../lib/exactMoney");
 const { Product } = loadModule("../entity/Product") as typeof import("../entity/Product");
 const { Category } = loadModule("../entity/Category") as typeof import("../entity/Category");
 const { TaxClass } = loadModule("../entity/TaxClass") as typeof import("../entity/TaxClass");
 const { Customer } = loadModule("../entity/Customer") as typeof import("../entity/Customer");
+const { CustomerVoucher } = loadModule("../entity/CustomerVoucher") as typeof import("../entity/CustomerVoucher");
 const { StoreCredit, StoreCreditStatus } = loadModule("../entity/StoreCredit") as typeof import("../entity/StoreCredit");
 const { Vendor } = loadModule("../entity/Vendor") as typeof import("../entity/Vendor");
+const { Account } = loadModule("../entity/Account") as typeof import("../entity/Account");
 const { Warehouse } = loadModule("../entity/Warehouse") as typeof import("../entity/Warehouse");
 const { WarehouseStock } = loadModule("../entity/WarehouseStock") as typeof import("../entity/WarehouseStock");
+const { Purchase } = loadModule("../entity/Purchase") as typeof import("../entity/Purchase");
 const { StockMovement } = loadModule("../entity/StockMovement") as typeof import("../entity/StockMovement");
 const { StockTake } = loadModule("../entity/StockTake") as typeof import("../entity/StockTake");
 const { InventoryAdjustment } = loadModule("../entity/InventoryAdjustment") as typeof import("../entity/InventoryAdjustment");
@@ -136,6 +147,10 @@ const { CreditNote } = loadModule("../entity/CreditNote") as typeof import("../e
 const { JournalEntry } = loadModule("../entity/JournalEntry") as typeof import("../entity/JournalEntry");
 const { JournalLine } = loadModule("../entity/JournalLine") as typeof import("../entity/JournalLine");
 const { AccountingService } = loadModule("../services/AccountingService") as typeof import("../services/AccountingService");
+const { InventoryService } = loadModule("../services/InventoryService") as typeof import("../services/InventoryService");
+const { VoucherService } = loadModule("../services/VoucherService") as typeof import("../services/VoucherService");
+const { renewedExpiryDate } = loadModule("../lib/voucherRules") as typeof import("../lib/voucherRules");
+const { VoucherRenewal } = loadModule("../entity/VoucherRenewal") as typeof import("../entity/VoucherRenewal");
 const { SocketService } = loadModule("../services/SocketService") as typeof import("../services/SocketService");
 const { io: createSocketClient } = loadModule("socket.io-client") as typeof import("socket.io-client");
 const { Client: PgClient } = loadModule("pg") as typeof import("pg");
@@ -143,6 +158,8 @@ const { EtimsMockService } = loadModule("../services/EtimsMockService") as typeo
 const { EnforceSingleMainWarehouse1790920000000 } = loadModule("../migration/1790920000000-EnforceSingleMainWarehouse") as typeof import("../migration/1790920000000-EnforceSingleMainWarehouse");
 const { AddPurchaseOrderReceivingWarehouse1790928000000 } = loadModule("../migration/1790928000000-AddPurchaseOrderReceivingWarehouse") as typeof import("../migration/1790928000000-AddPurchaseOrderReceivingWarehouse");
 const { EnforceUniqueSupplierInvoiceNumber1790930000000 } = loadModule("../migration/1790930000000-EnforceUniqueSupplierInvoiceNumber") as typeof import("../migration/1790930000000-EnforceUniqueSupplierInvoiceNumber");
+const { AddSupplierPaymentIdempotency1792410000000 } = loadModule("../migration/1792410000000-AddSupplierPaymentIdempotency") as typeof import("../migration/1792410000000-AddSupplierPaymentIdempotency");
+const { AddManualSupplierInvoices1792420000000 } = loadModule("../migration/1792420000000-AddManualSupplierInvoices") as typeof import("../migration/1792420000000-AddManualSupplierInvoices");
 const { CreateStockMovementLedger1790936000000 } = loadModule("../migration/1790936000000-CreateStockMovementLedger") as typeof import("../migration/1790936000000-CreateStockMovementLedger");
 const { AddMpesaCheckoutSessions1791000000000 } = loadModule("../migration/1791000000000-AddMpesaCheckoutSessions") as typeof import("../migration/1791000000000-AddMpesaCheckoutSessions");
 const { CreatePaymentCheckoutSessions1791010000000 } = loadModule("../migration/1791010000000-CreatePaymentCheckoutSessions") as typeof import("../migration/1791010000000-CreatePaymentCheckoutSessions");
@@ -168,6 +185,7 @@ let createdImportedProductSku = "";
 let createdQcProductSku = "";
 let createdCustomerPhone = "";
 let createdVendorId = "";
+let createdManualSupplierVendorId = "";
 let createdReceivingWarehouseId = "";
 let createdAggregateWarehouseId = "";
 let createdTransferWarehouseId = "";
@@ -238,9 +256,384 @@ test.before(async () => {
     }
 });
 
+test("a receipt clearing negative stock posts its residual as an audited adjustment", async () => {
+    const queryRunner = AppDataSource.createQueryRunner();
+    await queryRunner.connect();
+    await queryRunner.startTransaction();
+    try {
+        const warehouse = await queryRunner.manager.save(Warehouse, queryRunner.manager.create(Warehouse, {
+            name: `Residual valuation ${randomUUID()}`,
+            location_address: "Integration test",
+            is_main: false,
+        }));
+        const product = await queryRunner.manager.save(Product, queryRunner.manager.create(Product, {
+            sku: `RESIDUAL-${randomUUID()}`,
+            name: "Negative stock residual integration product",
+            unit_cost: 50,
+            retail_price: 70,
+            tax_rate: 0,
+            unit_of_measure: "piece",
+            stock_on_hand: -10,
+        }));
+        await queryRunner.manager.save(WarehouseStock, queryRunner.manager.create(WarehouseStock, {
+            warehouse_id: warehouse.id,
+            product_id: product.id,
+            stock_on_hand: -10,
+            stock_value_cents: "-45000",
+        }));
+        const purchase = await queryRunner.manager.save(Purchase, queryRunner.manager.create(Purchase, {
+            vendor_id: null,
+            warehouse_id: warehouse.id,
+            delivery_note_id: null,
+            reference: "Residual valuation integration test",
+            purchase_kind: "receipt",
+            purchased_at: new Date(),
+            created_by: adminUserId,
+        }));
+
+        await InventoryService.receiveStock(
+            queryRunner.manager,
+            product.id,
+            warehouse.id,
+            10,
+            purchase.id,
+            adminUserId,
+            5_000n,
+        );
+
+        const resultingStock = await queryRunner.manager.findOneByOrFail(WarehouseStock, {
+            warehouse_id: warehouse.id,
+            product_id: product.id,
+        });
+        assert.equal(resultingStock.stock_on_hand, 0);
+        assert.equal(resultingStock.stock_value_cents, "0");
+        const costAdjustment = await queryRunner.manager.findOneByOrFail(InventoryAdjustment, {
+            product_id: product.id,
+            warehouse_id: warehouse.id,
+        });
+        assert.equal(costAdjustment.quantity_adjusted, 0);
+        assert.equal(Number(costAdjustment.total_value_adjusted), 50);
+        assert.match(costAdjustment.reason, /negative stock was replenished to zero/i);
+
+        const varianceMovement = await queryRunner.manager.findOneByOrFail(StockMovement, {
+            product_id: product.id,
+            movement_type: "inventory_value_adjustment",
+        });
+        assert.equal(varianceMovement.quantity, 0);
+        assert.equal(varianceMovement.value_change_cents, "-5000");
+        assert.equal(varianceMovement.reference_id, costAdjustment.id);
+        assert.equal(varianceMovement.created_by, adminUserId);
+
+        const journalLines = await queryRunner.manager.find(JournalLine, {
+            where: { journal_entry: { reference_id: costAdjustment.id } },
+            relations: ["account", "journal_entry"],
+        });
+        assert.ok(journalLines.some((line) => line.account.code === "5100" && Number(line.debit) === 50));
+        assert.ok(journalLines.some((line) => line.account.code === "1300" && Number(line.credit) === 50));
+    } finally {
+        await queryRunner.rollbackTransaction();
+        await queryRunner.release();
+    }
+});
+
+test("voucher ledger totals and on-time/lapsed renewal dates persist exactly", async () => {
+    const queryRunner = AppDataSource.createQueryRunner();
+    await queryRunner.connect();
+    await queryRunner.startTransaction();
+    try {
+        const customer = await queryRunner.manager.save(Customer, queryRunner.manager.create(Customer, {
+            name: "Voucher renewal integration customer",
+            phone: `2547${String(Date.now()).slice(-8)}`,
+        }));
+        const voucher = await queryRunner.manager.save(CustomerVoucher, queryRunner.manager.create(CustomerVoucher, {
+            customer_id: customer.id,
+            voucher_number: "9999999998",
+            issue_date: "2026-10-18",
+            expiry_date: "2027-10-18",
+        }));
+
+        let expectedBalance = 0n;
+        let seed = 29;
+        const next = () => {
+            seed = (seed * 48_271) % 2_147_483_647;
+            return seed;
+        };
+        for (let index = 0; index < 100; index += 1) {
+            const operation = next() % 3;
+            if (operation === 0 || expectedBalance === 0n) {
+                const points = BigInt((next() % 80) + 1);
+                await VoucherService.append(queryRunner.manager, {
+                    voucherId: voucher.id,
+                    type: "earn",
+                    points,
+                    actorId: adminUserId,
+                });
+                expectedBalance += points;
+            } else if (operation === 1) {
+                const maxPoints = expectedBalance < 80n ? expectedBalance : 80n;
+                const points = BigInt((next() % Number(maxPoints)) + 1);
+                await VoucherService.append(queryRunner.manager, {
+                    voucherId: voucher.id,
+                    type: "redeem",
+                    points: -points,
+                    actorId: adminUserId,
+                });
+                expectedBalance -= points;
+            } else if (next() % 2 === 0) {
+                const points = BigInt((next() % 80) + 1);
+                await VoucherService.append(queryRunner.manager, {
+                    voucherId: voucher.id,
+                    type: "reversal",
+                    points,
+                    actorId: adminUserId,
+                });
+                expectedBalance += points;
+            } else {
+                const maxPoints = expectedBalance < 80n ? expectedBalance : 80n;
+                const points = BigInt((next() % Number(maxPoints)) + 1);
+                await VoucherService.append(queryRunner.manager, {
+                    voucherId: voucher.id,
+                    type: "reversal",
+                    points: -points,
+                    actorId: adminUserId,
+                });
+                expectedBalance -= points;
+            }
+        }
+
+        const balanceBeforeRenewal = await VoucherService.getBalance(queryRunner.manager, voucher.id);
+        assert.equal(balanceBeforeRenewal, expectedBalance);
+        const voucherNumber = voucher.voucher_number;
+        const onTimeRenewal = await VoucherService.renew(
+            queryRunner.manager,
+            voucher.id,
+            adminUserId,
+            "2026-10-18",
+        );
+        assert.equal(onTimeRenewal.voucher.voucher_number, voucherNumber);
+        assert.equal(onTimeRenewal.voucher.expiry_date, "2028-10-18");
+        assert.equal(onTimeRenewal.balance, expectedBalance);
+        await assert.rejects(
+            VoucherService.renew(queryRunner.manager, voucher.id, adminUserId, "2026-10-18"),
+            /already renewed this year/i,
+        );
+
+        const lapsedCustomer = await queryRunner.manager.save(Customer, queryRunner.manager.create(Customer, {
+            name: "Lapsed voucher renewal integration customer",
+            phone: `2547${String(Date.now() + 1).slice(-8)}`,
+        }));
+        const lapsedVoucher = await queryRunner.manager.save(CustomerVoucher, queryRunner.manager.create(CustomerVoucher, {
+            customer_id: lapsedCustomer.id,
+            voucher_number: "9999999997",
+            issue_date: "2025-10-18",
+            expiry_date: "2026-10-17",
+        }));
+        await VoucherService.append(queryRunner.manager, {
+            voucherId: lapsedVoucher.id,
+            type: "earn",
+            points: 321n,
+            actorId: adminUserId,
+        });
+        const lapsedRenewal = await VoucherService.renew(
+            queryRunner.manager,
+            lapsedVoucher.id,
+            adminUserId,
+            "2026-10-18",
+        );
+        assert.equal(lapsedRenewal.voucher.voucher_number, lapsedVoucher.voucher_number);
+        assert.equal(lapsedRenewal.voucher.expiry_date, "2027-10-18");
+        assert.equal(lapsedRenewal.balance, 321n);
+    } finally {
+        await queryRunner.rollbackTransaction();
+        await queryRunner.release();
+    }
+});
+
+test("paid voucher renewal requires exact settlement and posts VAT/accounting atomically", async () => {
+    const queryRunner = AppDataSource.createQueryRunner();
+    await queryRunner.connect();
+    await queryRunner.startTransaction();
+    try {
+        const setting = await queryRunner.manager.findOneBy(Setting, { key: "voucher_renewal_fee_cents" });
+        if (setting) {
+            setting.value = "11600";
+            await queryRunner.manager.save(setting);
+        } else {
+            await queryRunner.manager.save(Setting, queryRunner.manager.create(Setting, {
+                key: "voucher_renewal_fee_cents",
+                value: "11600",
+            }));
+        }
+        const customer = await queryRunner.manager.save(Customer, queryRunner.manager.create(Customer, {
+            name: "Paid voucher renewal integration customer",
+            phone: `2547${String(Date.now() + 2).slice(-8)}`,
+        }));
+        const voucher = await queryRunner.manager.save(CustomerVoucher, queryRunner.manager.create(CustomerVoucher, {
+            customer_id: customer.id,
+            voucher_number: "9999999995",
+            issue_date: "2020-01-01",
+            expiry_date: "2020-01-01",
+        }));
+        await VoucherService.append(queryRunner.manager, {
+            voucherId: voucher.id,
+            type: "earn",
+            points: 875n,
+            actorId: adminUserId,
+        });
+        let shift = await queryRunner.manager.findOneBy(Shift, {
+            cashier_id: adminUserId,
+            status: ShiftStatus.OPEN,
+        });
+        if (!shift) {
+            shift = await queryRunner.manager.save(Shift, queryRunner.manager.create(Shift, {
+                cashier_id: adminUserId,
+                status: ShiftStatus.OPEN,
+                opening_float: "100.00",
+                expected_cash: "100.00",
+                mpesa_total: "0.00",
+                total_sales: "0.00",
+            }));
+        }
+        const oldExpectedCash = Number(shift.expected_cash);
+        const oldMpesaTotal = Number(shift.mpesa_total);
+        const oldTotalSales = Number(shift.total_sales);
+        const checkout = await VoucherService.startRenewalCheckout(
+            queryRunner.manager,
+            voucher.id,
+            adminUserId,
+        );
+        assert.equal(checkout.purpose, "voucher_renewal");
+        assert.deepEqual(checkout.items, []);
+        assert.equal(Number(checkout.subtotal), 100);
+        assert.equal(Number(checkout.tax_amount), 16);
+        assert.equal(Number(checkout.total_amount), 116);
+
+        await queryRunner.manager.save(MpesaTransaction, queryRunner.manager.create(MpesaTransaction, {
+            sale_id: null,
+            cashier_id: adminUserId,
+            checkout_session_id: checkout.id,
+            transaction_code: `RENEWAL_TEST_${randomUUID()}`,
+            phone_number: "254712345678",
+            amount: 99,
+            status: "completed",
+            mpesa_receipt_number: "RENEWAL99",
+        }));
+        const reviewRequiredPayment = await queryRunner.manager.save(
+            MpesaTransaction,
+            queryRunner.manager.create(MpesaTransaction, {
+                sale_id: null,
+                cashier_id: adminUserId,
+                checkout_session_id: checkout.id,
+                transaction_code: `RENEWAL_REVIEW_${randomUUID()}`,
+                phone_number: "254712345678",
+                amount: 1,
+                status: "needs_review",
+                mismatch_reason: "Callback amount mismatch",
+            }),
+        );
+        const reviewStatus = await VoucherService.renewalCheckoutStatus(
+            queryRunner.manager,
+            checkout,
+            adminUserId,
+        );
+        assert.equal(reviewStatus.mpesa_transactions.find((transaction) =>
+            transaction.id === reviewRequiredPayment.id)?.mismatch_reason, "Callback amount mismatch");
+        await assert.rejects(
+            VoucherService.recordRenewalCashPayment(queryRunner.manager, checkout.id, adminUserId, 1_600n),
+            /under review/i,
+        );
+        await assert.rejects(
+            VoucherService.completeRenewalCheckout(queryRunner.manager, checkout.id, adminUserId),
+            /under review/i,
+        );
+        await queryRunner.manager.update(MpesaTransaction, { id: reviewRequiredPayment.id }, { status: "failed" });
+        await VoucherService.recordRenewalCashPayment(
+            queryRunner.manager,
+            checkout.id,
+            adminUserId,
+            1_600n,
+        );
+        await assert.rejects(
+            VoucherService.completeRenewalCheckout(queryRunner.manager, checkout.id, adminUserId),
+            /full voucher renewal fee/i,
+        );
+        await queryRunner.manager.save(MpesaTransaction, queryRunner.manager.create(MpesaTransaction, {
+            sale_id: null,
+            cashier_id: adminUserId,
+            checkout_session_id: checkout.id,
+            transaction_code: `RENEWAL_TEST_${randomUUID()}`,
+            phone_number: "254712345678",
+            amount: 1,
+            status: "completed",
+            mpesa_receipt_number: "RENEWAL1",
+        }));
+
+        const completed = await VoucherService.completeRenewalCheckout(
+            queryRunner.manager,
+            checkout.id,
+            adminUserId,
+        );
+        assert.equal(completed.voucher.voucher_number, "9999999995");
+        assert.equal(completed.balance, 875n);
+        assert.equal(
+            completed.voucher.expiry_date,
+            renewedExpiryDate(voucher.expiry_date, new Date().toISOString().slice(0, 10)),
+        );
+        assert.equal(completed.renewal.fee_cents, "11600");
+        assert.equal(completed.renewal.cash_paid_cents, "1600");
+        assert.equal(completed.renewal.mpesa_paid_cents, "10000");
+        assert.equal(completed.renewal.checkout_session_id, checkout.id);
+
+        const idempotentResult = await VoucherService.completeRenewalCheckout(
+            queryRunner.manager,
+            checkout.id,
+            adminUserId,
+        );
+        assert.equal(idempotentResult.renewal.id, completed.renewal.id);
+        const journal = await queryRunner.manager.findOneByOrFail(JournalEntry, {
+            reference_id: completed.renewal.id,
+            reference_type: "VOUCHER_RENEWAL",
+        });
+        const lines = await queryRunner.manager.find(JournalLine, {
+            where: { journal_entry: { id: journal.id } },
+            relations: ["account"],
+        });
+        assert.equal(
+            lines.reduce((sum, line) => sum + Number(line.debit), 0),
+            116,
+        );
+        assert.equal(
+            lines.reduce((sum, line) => sum + Number(line.credit), 0),
+            116,
+        );
+        assert.ok(lines.some((line) => line.account.code === "2200" && Number(line.credit) === 16));
+        shift = await queryRunner.manager.findOneByOrFail(Shift, { id: shift.id });
+        assert.equal(Number(shift.expected_cash), oldExpectedCash + 16);
+        assert.equal(Number(shift.mpesa_total), oldMpesaTotal + 100);
+        assert.equal(Number(shift.total_sales), oldTotalSales + 116);
+    } finally {
+        await queryRunner.rollbackTransaction();
+        await queryRunner.release();
+    }
+});
+
 test.after(async () => {
     if (AppDataSource.isInitialized) {
         try {
+            // The integration database is disposable; disable audit guards only for fixture teardown.
+            for (const table of [
+                "customer_vouchers",
+                "purchases",
+                "purchase_items",
+                "return_items",
+                "sales",
+                "sale_items",
+                "stock_movements",
+                "voucher_renewals",
+                "voucher_card_print_logs",
+            ]) {
+                await AppDataSource.query(`ALTER TABLE "${table}" DISABLE TRIGGER USER`);
+            }
             for (const returnRequestId of [createdReturnRequestId, createdDiscountedReturnRequestId, createdSecondDiscountedReturnRequestId, createdFirstTaxRoundingReturnId, createdSecondTaxRoundingReturnId, createdEtimsFailureReturnId, createdNoShiftCashReturnId, createdExchangeReturnRequestId, createdMpesaReturnRequestId]) {
                 if (returnRequestId) {
                     await AppDataSource.getRepository(ReturnRequest).delete({ id: returnRequestId });
@@ -267,6 +660,15 @@ test.after(async () => {
                 await AppDataSource.getRepository(SupplierPayment).delete({ id: paymentId });
             }
             if (createdSupplierInvoiceIds.length > 0) {
+                const invoiceJournals = (await Promise.all(createdSupplierInvoiceIds.map((reference_id) =>
+                    AppDataSource.getRepository(JournalEntry).find({
+                        where: { reference_id, reference_type: "SUPPLIER_INVOICE" },
+                    }),
+                ))).flat();
+                for (const journalEntry of invoiceJournals) {
+                    await AppDataSource.getRepository(JournalLine).delete({ journal_entry_id: journalEntry.id });
+                    await AppDataSource.getRepository(JournalEntry).delete({ id: journalEntry.id });
+                }
                 await AppDataSource.getRepository(SupplierInvoice).delete(createdSupplierInvoiceIds);
             }
             if (createdPurchaseOrderId) {
@@ -322,7 +724,15 @@ test.after(async () => {
             }
             if (createdProductSku) {
                 const testProduct = await AppDataSource.getRepository(Product).findOneBy({ sku: createdProductSku });
-                if (testProduct) {
+                const productPurchaseHistory = testProduct
+                    ? await AppDataSource.query(
+                        `SELECT EXISTS (
+                            SELECT 1 FROM "purchase_items" WHERE "product_id" = $1
+                         ) AS exists`,
+                        [testProduct.id],
+                    )
+                    : [{ exists: false }];
+                if (testProduct && !productPurchaseHistory[0].exists) {
                     await AppDataSource.getRepository(StockMovement).delete({ product_id: testProduct.id });
                 }
                 if (createdStockTakeId) {
@@ -347,8 +757,21 @@ test.after(async () => {
                         await AppDataSource.getRepository(SaleItem).delete({ sale: { id: remainingSale.id } });
                         await AppDataSource.getRepository(Sale).delete({ id: remainingSale.id });
                     }
-                    await AppDataSource.getRepository(WarehouseStock).delete({ warehouse_id: createdReceivingWarehouseId });
-                    await AppDataSource.getRepository(Warehouse).delete({ id: createdReceivingWarehouseId });
+                    const warehousePurchaseHistory = await AppDataSource.query(
+                        `SELECT EXISTS (
+                            SELECT 1 FROM "purchases" WHERE "warehouse_id" = $1
+                         ) AS exists`,
+                        [createdReceivingWarehouseId],
+                    );
+                    if (warehousePurchaseHistory[0].exists) {
+                        await AppDataSource.getRepository(Warehouse).update(
+                            { id: createdReceivingWarehouseId },
+                            { is_active: false },
+                        );
+                    } else {
+                        await AppDataSource.getRepository(WarehouseStock).delete({ warehouse_id: createdReceivingWarehouseId });
+                        await AppDataSource.getRepository(Warehouse).delete({ id: createdReceivingWarehouseId });
+                    }
                 }
                 if (createdAggregateWarehouseId) {
                     await AppDataSource.getRepository(WarehouseStock).delete({ warehouse_id: createdAggregateWarehouseId });
@@ -358,22 +781,43 @@ test.after(async () => {
                     await AppDataSource.getRepository(WarehouseStock).delete({ warehouse_id: createdTransferWarehouseId });
                     await AppDataSource.getRepository(Warehouse).delete({ id: createdTransferWarehouseId });
                 }
-                if (testProduct) {
+                if (testProduct && !productPurchaseHistory[0].exists) {
                     await AppDataSource.getRepository(ProductBatch).delete({ product_id: testProduct.id });
+                    await AppDataSource.getRepository(Product).delete({ sku: createdProductSku });
                 }
-                await AppDataSource.getRepository(Product).delete({ sku: createdProductSku });
             }
             if (createdImportedProductSku) {
                 const importedProduct = await AppDataSource.getRepository(Product).findOneBy({ sku: createdImportedProductSku });
                 if (importedProduct) {
-                    await AppDataSource.getRepository(StockMovement).delete({ product_id: importedProduct.id });
-                    await AppDataSource.getRepository(WarehouseStock).delete({ product_id: importedProduct.id });
-                    await AppDataSource.getRepository(Product).delete({ id: importedProduct.id });
+                    const purchaseHistory = await AppDataSource.query(
+                        `SELECT EXISTS (
+                            SELECT 1 FROM "purchase_items" WHERE "product_id" = $1
+                         ) AS exists`,
+                        [importedProduct.id],
+                    );
+                    if (!purchaseHistory[0].exists) {
+                        await AppDataSource.getRepository(StockMovement).delete({ product_id: importedProduct.id });
+                        await AppDataSource.getRepository(WarehouseStock).delete({ product_id: importedProduct.id });
+                        await AppDataSource.getRepository(Product).delete({ id: importedProduct.id });
+                    }
                 }
             }
             if (createdQcProductSku) {
                 const qcProduct = await AppDataSource.getRepository(Product).findOneBy({ sku: createdQcProductSku });
                 if (qcProduct) {
+                    const qcPurchases = await AppDataSource.query(
+                        `SELECT "purchase_id" FROM "purchase_items" WHERE "product_id" = $1`,
+                        [qcProduct.id],
+                    ) as Array<{ purchase_id: string }>;
+                    await AppDataSource.query(`DELETE FROM "purchase_items" WHERE "product_id" = $1`, [qcProduct.id]);
+                    for (const { purchase_id } of qcPurchases) {
+                        await AppDataSource.query(
+                            `DELETE FROM "purchases" WHERE "id" = $1 AND NOT EXISTS (
+                                SELECT 1 FROM "purchase_items" WHERE "purchase_id" = $1
+                            )`,
+                            [purchase_id],
+                        );
+                    }
                     await AppDataSource.getRepository(StockMovement).delete({ product_id: qcProduct.id });
                     await AppDataSource.getRepository(WarehouseStock).delete({ product_id: qcProduct.id });
                     await AppDataSource.getRepository(ProductBatch).delete({ product_id: qcProduct.id });
@@ -381,20 +825,70 @@ test.after(async () => {
                 }
             }
             if (createdCustomerPhone) {
-                await AppDataSource.getRepository(Customer).delete({ phone: createdCustomerPhone });
+                const customer = await AppDataSource.getRepository(Customer).findOneBy({ phone: createdCustomerPhone });
+                if (customer) {
+                    const hasVoucher = await AppDataSource.query(
+                        `SELECT EXISTS (
+                            SELECT 1 FROM "customer_vouchers" WHERE "customer_id" = $1
+                         ) AS exists`,
+                        [customer.id],
+                    );
+                    if (!hasVoucher[0].exists) {
+                        await AppDataSource.getRepository(Customer).delete({ phone: createdCustomerPhone });
+                    }
+                }
             }
             if (createdVendorId) {
-                await AppDataSource.getRepository(Vendor).delete({ id: createdVendorId });
+                const hasPurchases = await AppDataSource.query(
+                    `SELECT EXISTS (
+                        SELECT 1 FROM "purchases" WHERE "vendor_id" = $1
+                     ) AS exists`,
+                    [createdVendorId],
+                );
+                if (!hasPurchases[0].exists) {
+                    await AppDataSource.getRepository(Vendor).delete({ id: createdVendorId });
+                }
+            }
+            if (createdManualSupplierVendorId) {
+                await AppDataSource.getRepository(Vendor).delete({ id: createdManualSupplierVendorId });
             }
             if (adminUserId) {
-                await AppDataSource.getRepository(User).delete({ id: adminUserId });
+                const hasCostingOrVoucherHistory = await AppDataSource.query(
+                    `SELECT
+                        EXISTS (SELECT 1 FROM "purchases" WHERE "created_by" = $1)
+                        OR EXISTS (SELECT 1 FROM "voucher_ledger" WHERE "created_by" = $1)
+                        OR EXISTS (SELECT 1 FROM "voucher_renewals" WHERE "renewed_by" = $1)
+                        OR EXISTS (SELECT 1 FROM "voucher_card_print_logs" WHERE "printed_by" = $1)
+                        OR EXISTS (SELECT 1 FROM "inventory_period_closes" WHERE "closed_by" = $1)
+                        AS exists`,
+                    [adminUserId],
+                );
+                if (!hasCostingOrVoucherHistory[0].exists) {
+                    await AppDataSource.getRepository(User).delete({ id: adminUserId });
+                }
             }
             if (registeredAuthEmail) {
                 await AppDataSource.getRepository(User).delete({ email: registeredAuthEmail });
             }
         } finally {
             EmailService.sendOtpEmail = originalSendOtpEmail;
-            await AppDataSource.destroy();
+            try {
+                for (const table of [
+                    "customer_vouchers",
+                    "purchases",
+                    "purchase_items",
+                    "return_items",
+                    "sales",
+                    "sale_items",
+                    "stock_movements",
+                    "voucher_renewals",
+                    "voucher_card_print_logs",
+                ]) {
+                    await AppDataSource.query(`ALTER TABLE "${table}" ENABLE TRIGGER USER`);
+                }
+            } finally {
+                await AppDataSource.destroy();
+            }
         }
     }
 });
@@ -727,7 +1221,7 @@ test("admin can access protected product workflow and reject unauthorized reques
         assert.equal(predictionResult.success, true);
         assert.equal(predictionResult.source, "statistical");
         assert.equal(predictionResult.predictions.salesForecast.historyDays, 90);
-        assert.ok(Number.isFinite(predictionResult.predictions.salesForecast.next7Days));
+        assert.match(predictionResult.predictions.salesForecast.next7Days, /^\d+\.\d{2}$/);
         assert.ok(Array.isArray(predictionResult.predictions.inventoryAlerts));
         assert.ok(Array.isArray(predictionResult.predictions.recommendations));
 
@@ -809,11 +1303,33 @@ test("admin can access protected product workflow and reject unauthorized reques
         assert.equal(blockedQcSaleResponse.status, 400, "Sales must reject stock from pending QC batches");
         const qcProductAfterBlockedSale = await AppDataSource.getRepository(Product).findOneByOrFail({ id: qcProduct.id });
         assert.equal(qcProductAfterBlockedSale.stock_on_hand, 5, "Pending QC stock must remain locked from sale");
-        await AppDataSource.getRepository(StockMovement).delete({ product_id: qcProduct.id });
-        await AppDataSource.getRepository(WarehouseStock).delete({ product_id: qcProduct.id });
-        await AppDataSource.getRepository(ProductBatch).delete({ product_id: qcProduct.id });
-        await AppDataSource.getRepository(Product).delete({ id: qcProduct.id });
-        createdQcProductSku = "";
+        await AppDataSource.query(`ALTER TABLE "purchases" DISABLE TRIGGER USER`);
+        await AppDataSource.query(`ALTER TABLE "purchase_items" DISABLE TRIGGER USER`);
+        await AppDataSource.query(`ALTER TABLE "stock_movements" DISABLE TRIGGER USER`);
+        try {
+            const qcPurchases = await AppDataSource.query(
+                `SELECT "purchase_id" FROM "purchase_items" WHERE "product_id" = $1`,
+                [qcProduct.id],
+            ) as Array<{ purchase_id: string }>;
+            await AppDataSource.query(`DELETE FROM "purchase_items" WHERE "product_id" = $1`, [qcProduct.id]);
+            for (const { purchase_id } of qcPurchases) {
+                await AppDataSource.query(
+                    `DELETE FROM "purchases" WHERE "id" = $1 AND NOT EXISTS (
+                        SELECT 1 FROM "purchase_items" WHERE "purchase_id" = $1
+                    )`,
+                    [purchase_id],
+                );
+            }
+            await AppDataSource.getRepository(StockMovement).delete({ product_id: qcProduct.id });
+            await AppDataSource.getRepository(WarehouseStock).delete({ product_id: qcProduct.id });
+            await AppDataSource.getRepository(ProductBatch).delete({ product_id: qcProduct.id });
+            await AppDataSource.getRepository(Product).delete({ id: qcProduct.id });
+            createdQcProductSku = "";
+        } finally {
+            await AppDataSource.query(`ALTER TABLE "stock_movements" ENABLE TRIGGER USER`);
+            await AppDataSource.query(`ALTER TABLE "purchase_items" ENABLE TRIGGER USER`);
+            await AppDataSource.query(`ALTER TABLE "purchases" ENABLE TRIGGER USER`);
+        }
 
         const callbackSale = new Sale();
         callbackSale.cashier = await AppDataSource.getRepository(User).findOneByOrFail({ id: adminUserId });
@@ -1317,7 +1833,7 @@ test("admin can access protected product workflow and reject unauthorized reques
         assert.equal(discountedSaleResponse.status, 201, "Discounted sale should be created");
         const discountedSale = (await discountedSaleResponse.json()) as IntegrationApiObject;
         createdDiscountedSaleId = discountedSale.id;
-        assert.equal(Number(discountedSale.subtotal), 36);
+        assert.equal(Number(discountedSale.subtotal), 30);
         assert.equal(Number(discountedSale.total_amount), 30);
         const discountedSaleJournal = await AppDataSource.getRepository(JournalEntry).findOneByOrFail({
             reference_id: discountedSale.id,
@@ -1470,7 +1986,7 @@ test("admin can access protected product workflow and reject unauthorized reques
             assert.equal(taxRoundingSaleResponse.status, 201);
             const taxRoundingSale = (await taxRoundingSaleResponse.json()) as IntegrationApiObject;
             createdTaxRoundingSaleId = taxRoundingSale.id;
-            assert.equal(Number(taxRoundingSale.total_amount), 0.11);
+            assert.equal(Number(taxRoundingSale.total_amount), 0.1);
             assert.equal(Number(taxRoundingSale.tax_amount), 0.01);
 
             const taxRoundingSaleDetailsResponse = await fetch(
@@ -1505,7 +2021,7 @@ test("admin can access protected product workflow and reject unauthorized reques
                 const approvalResult = await approvalResponse.json() as IntegrationApiObject;
                 taxRoundingCreditNotes.push(Number(approvalResult.creditNote.amount));
             }
-            assert.deepEqual(taxRoundingCreditNotes, [0.06, 0.05]);
+            assert.deepEqual(taxRoundingCreditNotes, [0.04, 0.06]);
             const taxRoundingReversals = await AppDataSource.getRepository(JournalEntry).findBy({
                 reference_id: taxRoundingSale.id,
                 reference_type: "SALE_VOID",
@@ -1527,7 +2043,7 @@ test("admin can access protected product workflow and reject unauthorized reques
                 taxRoundingReversalLines
                     .filter((line) => line.account.code === "2300")
                     .reduce((sum, line) => sum + Number(line.credit), 0),
-                0.11,
+                0.1,
             );
         } finally {
             productForTaxRounding.retail_price = originalRetailPrice;
@@ -1567,6 +2083,16 @@ test("admin can access protected product workflow and reject unauthorized reques
                 product: createdProduct,
                 quantity: 2,
                 unit_price: 18,
+                unit_cost: 10,
+                unit_cost_cents: "1000",
+                unit_cost_basis_cents: "1000",
+                unit_cost_basis_quantity: "1",
+                cogs_total: 20,
+                cogs_total_cents: "2000",
+                net_revenue_cents: "3600",
+                vat_cents: "0",
+                line_total_cents: "3600",
+                discount_cents: "0",
                 tax_rate: 0,
                 line_total: 36,
             })
@@ -1775,6 +2301,18 @@ test("admin can access protected product workflow and reject unauthorized reques
                 quality_check_status: "passed",
             }),
         ]);
+        const costingStockBeforeSale = await AppDataSource.getRepository(WarehouseStock).findOneByOrFail({
+            warehouse_id: receivingWarehouse.id,
+            product_id: createdProduct.id,
+        });
+        if (costingStockBeforeSale.stock_value_cents === null) {
+            throw new Error("Weighted-average COGS test requires valued warehouse stock");
+        }
+        const expectedSaleCogsCents = allocateWeightedAverageCogs(
+            costingStockBeforeSale.stock_on_hand,
+            BigInt(costingStockBeforeSale.stock_value_cents),
+            2,
+        ).cogsCents;
 
         const concurrentSaleResponses = await Promise.all([
             fetch(`http://127.0.0.1:${port}/api/sales`, {
@@ -1826,6 +2364,8 @@ test("admin can access protected product workflow and reject unauthorized reques
         assert.equal(returnableSales.length, 1);
         assert.equal(returnableSales[0].id, createdSale.id);
         assert.equal(returnableSales[0].invoice_number, invoice.invoice_number);
+        assert.equal(returnableSales[0].items[0].returnable_quantity, 2);
+        assert.equal(returnableSales[0].items[0].approved_returned_quantity, 0);
         const uuidReturnSearch = await fetch(
             `http://127.0.0.1:${port}/api/returns/search?invoice_number=${createdSale.id}`,
             { headers: tokenHeader },
@@ -1887,8 +2427,11 @@ test("admin can access protected product workflow and reject unauthorized reques
         });
         assert.ok(saleJournalLines.some((line) => line.account.code === "1000" && Number(line.debit) === 36));
         assert.ok(
-            saleJournalLines.some((line) => line.account.code === "5000" && Number(line.debit) === 25),
-            "Sale COGS must use the costs of the FEFO batches actually consumed",
+            saleJournalLines.some((line) =>
+                line.account.code === "5000" &&
+                Number(line.debit) === Number(centsToKesString(expectedSaleCogsCents))
+            ),
+            "Sale COGS must use weighted-average warehouse cost, not FEFO batch unit costs",
         );
         assert.ok(!saleJournalLines.some((line) => line.account.code === "1010" && Number(line.debit) > 0));
 
@@ -1923,8 +2466,8 @@ test("admin can access protected product workflow and reject unauthorized reques
         assert.equal(saleDetailsResponse.status, 200);
         const saleDetails = (await saleDetailsResponse.json() as IntegrationApiObject).sale;
         const saleItemId = saleDetails.items[0].id;
-        assert.equal(Number(saleDetails.items[0].unit_cost), 12.5);
-        assert.equal(Number(saleDetails.items[0].cogs_total), 25);
+        assert.equal(Number(saleDetails.items[0].unit_cost), 10);
+        assert.equal(Number(saleDetails.items[0].cogs_total), 20);
 
         const excessiveReturnResponse = await fetch(`http://127.0.0.1:${port}/api/returns/request`, {
             method: "POST",
@@ -1949,6 +2492,14 @@ test("admin can access protected product workflow and reject unauthorized reques
         assert.equal(returnRequestResponse.status, 201, "Valid return request should be created");
         const returnRequestBody = (await returnRequestResponse.json()) as IntegrationApiObject;
         createdReturnRequestId = returnRequestBody.request.id;
+        const pendingReturnSearch = await fetch(
+            `http://127.0.0.1:${port}/api/returns/search?invoice_number=${encodeURIComponent(invoice.invoice_number)}`,
+            { headers: tokenHeader },
+        );
+        assert.equal(pendingReturnSearch.status, 200);
+        const pendingReturnSales = await pendingReturnSearch.json() as IntegrationApiObject[];
+        assert.equal(pendingReturnSales[0].items[0].returnable_quantity, 1);
+        assert.equal(pendingReturnSales[0].items[0].approved_returned_quantity, 0);
 
         const approvalResponse = await fetch(`http://127.0.0.1:${port}/api/admin/returns/approve/${createdReturnRequestId}`, {
             method: "POST",
@@ -1962,6 +2513,14 @@ test("admin can access protected product workflow and reject unauthorized reques
             barcode: storeCreditApprovalBody.storeCreditBarcode,
         });
         assert.equal(Number(returnedStoreCredit.current_balance), 18);
+        const remainingReturnSearch = await fetch(
+            `http://127.0.0.1:${port}/api/returns/search?invoice_number=${encodeURIComponent(invoice.invoice_number)}`,
+            { headers: tokenHeader },
+        );
+        assert.equal(remainingReturnSearch.status, 200);
+        const remainingReturnSales = await remainingReturnSearch.json() as IntegrationApiObject[];
+        assert.equal(remainingReturnSales[0].items[0].returnable_quantity, 1);
+        assert.equal(remainingReturnSales[0].items[0].approved_returned_quantity, 1);
         const returnsListResponse = await fetch(`http://127.0.0.1:${port}/api/returns`, {
             headers: tokenHeader,
         });
@@ -1986,8 +2545,11 @@ test("admin can access protected product workflow and reject unauthorized reques
             line.account.code === "2300" && Number(line.credit) === 18
         ), "Store-credit refunds must credit the store-credit liability account");
 
-        const returnedProduct = await AppDataSource.getRepository(Product).findOneByOrFail({ id: createdProduct.id });
-        assert.equal(returnedProduct.stock_on_hand, 11, "Approving a sellable return should restore stock");
+        const returnedWarehouseStock = await AppDataSource.getRepository(WarehouseStock).findOneByOrFail({
+            warehouse_id: receivingWarehouse.id,
+            product_id: createdProduct.id,
+        });
+        assert.equal(returnedWarehouseStock.stock_on_hand, 11, "Approving a sellable return should restore stock to its sale warehouse");
         const returnedStockMovement = await AppDataSource.getRepository(StockMovement).findOneByOrFail({
             product_id: createdProduct.id,
             movement_type: "sale_return",
@@ -2051,9 +2613,35 @@ test("admin can access protected product workflow and reject unauthorized reques
                 .flatMap((entry) => entry.lines)
                 .filter((line) => line.account.code === "5000")
                 .reduce((sum, line) => sum + Number(line.credit), 0),
-            25,
-            "Sequential partial returns must reverse the original batch COGS exactly",
+            20,
+            "Sequential partial returns must reverse the original weighted-average COGS exactly",
         );
+
+        const cashPreviewCheckoutSessionId = randomUUID();
+        const cashPreviewResponse = await fetch(`http://127.0.0.1:${port}/api/sales/checkouts`, {
+            method: "POST",
+            headers: { ...tokenHeader, "Content-Type": "application/json" },
+            body: JSON.stringify({
+                checkout_session_id: cashPreviewCheckoutSessionId,
+                items: [{ product_id: createdProduct.id, quantity: 1 }],
+                warehouse_id: receivingWarehouse.id,
+            }),
+        });
+        assert.equal(cashPreviewResponse.status, 201, "Mobile cash checkout must reserve a server-priced total");
+        const cashPreview = await cashPreviewResponse.json() as IntegrationApiObject;
+        assert.equal(Number(cashPreview.total_amount), 18);
+        const exactCashConfirmationResponse = await fetch(
+            `http://127.0.0.1:${port}/api/sales/checkouts/${cashPreviewCheckoutSessionId}/confirm-cash`,
+            { method: "POST", headers: tokenHeader },
+        );
+        assert.equal(exactCashConfirmationResponse.status, 200, "Cash confirmation must use the reserved server total");
+        const exactCashCheckout = await exactCashConfirmationResponse.json() as IntegrationApiObject;
+        assert.equal(Number(exactCashCheckout.cash_amount), 18);
+        const cashPreviewCancellationResponse = await fetch(
+            `http://127.0.0.1:${port}/api/sales/checkouts/${cashPreviewCheckoutSessionId}/cancel`,
+            { method: "POST", headers: tokenHeader },
+        );
+        assert.equal(cashPreviewCancellationResponse.status, 200, "An unpaid exact-cash preview must release its reservation");
 
         const checkoutSessionId = randomUUID();
         const stkCheckoutRequestId = `checkout-${randomUUID()}`;
@@ -2698,9 +3286,23 @@ test("admin can access protected product workflow and reject unauthorized reques
             body: JSON.stringify({ actual_cash: 136 }),
         });
         assert.equal(blockedCloseResponse.status, 409);
-        assert.match((await blockedCloseResponse.json() as IntegrationApiObject).message, /resolve pending m-pesa payments/i);
+        assert.match((await blockedCloseResponse.json() as IntegrationApiObject).message, /resolve pending or review-required m-pesa payments/i);
         const stillOpenShift = await AppDataSource.getRepository(Shift).findOneByOrFail({ id: openedShift.id });
         assert.equal(stillOpenShift.status, "open");
+        await AppDataSource.getRepository(MpesaTransaction).update(
+            { id: unresolvedMpesaTransaction.id },
+            { status: "needs_review" },
+        );
+        const blockedReviewCloseResponse = await fetch(`http://127.0.0.1:${port}/api/shifts/${openedShift.id}/close`, {
+            method: "POST",
+            headers: { ...tokenHeader, "Content-Type": "application/json" },
+            body: JSON.stringify({ actual_cash: 136 }),
+        });
+        assert.equal(blockedReviewCloseResponse.status, 409, "Review-required M-Pesa transactions must keep the shift open");
+        assert.match(
+            (await blockedReviewCloseResponse.json() as IntegrationApiObject).message,
+            /resolve pending or review-required m-pesa payments/i,
+        );
         await AppDataSource.getRepository(MpesaTransaction).delete({ id: unresolvedMpesaTransaction.id });
         createdUnresolvedMpesaTransactionId = "";
 
@@ -2713,10 +3315,10 @@ test("admin can access protected product workflow and reject unauthorized reques
         const closedShift = (await closeShiftResponse.json() as IntegrationApiObject).shift;
         assert.equal(
             closedShift.expected_cash,
-            151.11,
-            "Cash refunds must reduce expected cash by the recorded discounted refund, not gross item value",
+            "151.10",
+            "Expected cash must account for the discounted cash refund and change returned to the customer",
         );
-        assert.equal(closedShift.mpesa_total, 18, "Shift M-Pesa totals must include only confirmed payouts as refunds");
+        assert.equal(closedShift.mpesa_total, "18.00", "Shift M-Pesa totals must include only confirmed payouts as refunds");
 
         const vendor = await AppDataSource.getRepository(Vendor).save(
             AppDataSource.getRepository(Vendor).create({
@@ -2766,6 +3368,14 @@ test("admin can access protected product workflow and reject unauthorized reques
             body: JSON.stringify({ status: "sent" }),
         });
         assert.equal(sentStatusResponse.status, 200, "Purchase order should transition to sent");
+        const productStockBeforeReceipt = await AppDataSource.getRepository(Product).findOneByOrFail({
+            id: createdProduct.id,
+        });
+        const warehouseStockBeforeReceipt = await AppDataSource.getRepository(WarehouseStock).findOneByOrFail({
+            warehouse_id: receivingWarehouse.id,
+            product_id: createdProduct.id,
+        });
+        const expectedWarehouseQuantityBeforeReceipt = warehouseStockBeforeReceipt.stock_on_hand;
 
         const duplicateLineReceiveResponse = await fetch(`http://127.0.0.1:${port}/api/purchase-orders/${createdPurchaseOrderId}/receive`, {
             method: "POST",
@@ -2781,7 +3391,15 @@ test("admin can access protected product workflow and reject unauthorized reques
         });
         assert.equal(duplicateLineReceiveResponse.status, 400, "Duplicate receipt lines must be validated against their cumulative quantity");
         const stockAfterDuplicateLineReceive = await AppDataSource.getRepository(Product).findOneByOrFail({ id: createdProduct.id });
-        assert.equal(stockAfterDuplicateLineReceive.stock_on_hand, 10, "Rejected duplicate receipt lines must not change stock");
+        assert.equal(stockAfterDuplicateLineReceive.stock_on_hand, productStockBeforeReceipt.stock_on_hand, "Rejected duplicate receipt lines must not change stock");
+        assert.equal(
+            (await AppDataSource.getRepository(WarehouseStock).findOneByOrFail({
+                warehouse_id: receivingWarehouse.id,
+                product_id: createdProduct.id,
+            })).stock_on_hand,
+            expectedWarehouseQuantityBeforeReceipt,
+            "Rejected duplicate receipt lines must not change destination warehouse stock",
+        );
 
         const excessiveReceiveResponse = await fetch(`http://127.0.0.1:${port}/api/purchase-orders/${createdPurchaseOrderId}/receive`, {
             method: "POST",
@@ -2799,7 +3417,15 @@ test("admin can access protected product workflow and reject unauthorized reques
         const excessiveReceiveBody = (await excessiveReceiveResponse.json()) as IntegrationApiObject;
         assert.equal(excessiveReceiveBody.message, "Receiving quantities exceed the purchase order");
         const stockAfterRejectedReceive = await AppDataSource.getRepository(Product).findOneByOrFail({ id: createdProduct.id });
-        assert.equal(stockAfterRejectedReceive.stock_on_hand, 10, "Rejected receipt must not change stock");
+        assert.equal(stockAfterRejectedReceive.stock_on_hand, productStockBeforeReceipt.stock_on_hand, "Rejected receipt must not change stock");
+        assert.equal(
+            (await AppDataSource.getRepository(WarehouseStock).findOneByOrFail({
+                warehouse_id: receivingWarehouse.id,
+                product_id: createdProduct.id,
+            })).stock_on_hand,
+            expectedWarehouseQuantityBeforeReceipt,
+            "Rejected receipt must not change destination warehouse stock",
+        );
 
         const receiveResponse = await fetch(`http://127.0.0.1:${port}/api/purchase-orders/${createdPurchaseOrderId}/receive`, {
             method: "POST",
@@ -2823,13 +3449,21 @@ test("admin can access protected product workflow and reject unauthorized reques
         assert.equal(receivedOrder.po.status, "received");
 
         const replenishedProduct = await AppDataSource.getRepository(Product).findOneByOrFail({ id: createdProduct.id });
-        assert.equal(replenishedProduct.stock_on_hand, 15, "Receiving five units should replenish stock after both confirmed M-Pesa sales");
+        assert.equal(
+            replenishedProduct.stock_on_hand,
+            productStockBeforeReceipt.stock_on_hand + 5,
+            "Receiving five units should increase the product's aggregate stock",
+        );
 
         const receivedWarehouseStock = await AppDataSource.getRepository(WarehouseStock).findOneByOrFail({
             warehouse_id: receivingWarehouse.id,
             product_id: createdProduct.id,
         });
-        assert.equal(receivedWarehouseStock.stock_on_hand, 15, "Receiving a PO must replenish its destination warehouse");
+        assert.equal(
+            receivedWarehouseStock.stock_on_hand,
+            expectedWarehouseQuantityBeforeReceipt + 5,
+            "Receiving a PO must replenish its destination warehouse",
+        );
 
         const receivedDeliveryNote = await AppDataSource.getRepository(DeliveryNote).findOneOrFail({
             where: { po_id: createdPurchaseOrderId },
@@ -2849,15 +3483,20 @@ test("admin can access protected product workflow and reject unauthorized reques
         assert.equal(deliveryNoteDetails.items.length, 1);
         assert.equal(deliveryNoteDetails.items[0].received_quantity, 5);
 
-        const receiptMovement = await AppDataSource.getRepository(StockMovement).findOneByOrFail({
-            reference_type: "delivery_note",
-            reference_id: receivedDeliveryNote.id,
-            product_id: createdProduct.id,
-        });
+        const receiptMovements = await AppDataSource.query(`
+            SELECT movement.*
+            FROM "stock_movements" movement
+            JOIN "purchases" purchase ON purchase."id" = movement."reference_id"
+            WHERE movement."reference_type" = 'purchase'
+              AND purchase."delivery_note_id" = $1
+              AND movement."product_id" = $2
+        `, [receivedDeliveryNote.id, createdProduct.id]);
+        assert.equal(receiptMovements.length, 1, "The stock movement must be traceable through its purchase and delivery note");
+        const receiptMovement = receiptMovements[0];
         assert.equal(receiptMovement.movement_type, "purchase_receipt");
         assert.equal(receiptMovement.quantity, 5);
-        assert.equal(receiptMovement.quantity_before, 10);
-        assert.equal(receiptMovement.quantity_after, 15);
+        assert.equal(receiptMovement.quantity_before, expectedWarehouseQuantityBeforeReceipt);
+        assert.equal(receiptMovement.quantity_after, expectedWarehouseQuantityBeforeReceipt + 5);
         const receivedProductBatch = await AppDataSource.getRepository(ProductBatch).findOneByOrFail({
             po_id: createdPurchaseOrderId,
             batch_number: "INTEGRATION-BATCH-01",
@@ -2888,10 +3527,28 @@ test("admin can access protected product workflow and reject unauthorized reques
         createdSupplierInvoiceIds.push(discrepancyInvoice.id);
         assert.equal(discrepancyInvoice.status, InvoiceStatus.DISCREPANCY);
 
+        const unsupportedTaxInvoiceResponse = await fetch(`http://127.0.0.1:${port}/api/procurement/supplier-invoices`, {
+            method: "POST",
+            headers: { ...tokenHeader, "Content-Type": "application/json" },
+            body: JSON.stringify({
+                ...invoicePayload,
+                invoice_number: `INV-UNSUPPORTED-TAX-${randomUUID()}`,
+                subtotal: 50,
+                tax_amount: 5,
+                total_amount: 55,
+            }),
+        });
+        assert.equal(unsupportedTaxInvoiceResponse.status, 400);
+
         const blockedPaymentResponse = await fetch(`http://127.0.0.1:${port}/api/procurement/supplier-invoices/${discrepancyInvoice.id}/payments`, {
             method: "POST",
             headers: { ...tokenHeader, "Content-Type": "application/json" },
-            body: JSON.stringify({ amount: 10, payment_method: "bank_transfer" }),
+            body: JSON.stringify({
+                amount: 10,
+                payment_method: "bank_transfer",
+                payment_date: "2026-10-02",
+                idempotency_key: randomUUID(),
+            }),
         });
         assert.equal(blockedPaymentResponse.status, 409, "Discrepant supplier invoices must not be paid");
         assert.equal(await AppDataSource.getRepository(SupplierPayment).countBy({ supplier_invoice_id: discrepancyInvoice.id }), 0);
@@ -2942,15 +3599,44 @@ test("admin can access protected product workflow and reject unauthorized reques
         });
         assert.equal(duplicateInvoiceResponse.status, 409, "A vendor's invoice number must not be recorded twice, regardless of case");
 
+        const partialPaymentIdempotencyKey = randomUUID();
+        const partialPaymentPayload = {
+            amount: 20,
+            payment_method: "bank_transfer",
+            payment_date: "2026-10-04",
+            idempotency_key: partialPaymentIdempotencyKey,
+        };
         const partialPaymentResponse = await fetch(`http://127.0.0.1:${port}/api/procurement/supplier-invoices/${matchedInvoice.id}/payments`, {
             method: "POST",
             headers: { ...tokenHeader, "Content-Type": "application/json" },
-            body: JSON.stringify({ amount: 20, payment_method: "bank_transfer" }),
+            body: JSON.stringify(partialPaymentPayload),
         });
         assert.equal(partialPaymentResponse.status, 201);
         const partialPaymentResult = await partialPaymentResponse.json() as IntegrationApiObject;
         createdSupplierPaymentIds.push(partialPaymentResult.payment.id);
         assert.equal(partialPaymentResult.invoice.balance_due, 30);
+
+        const repeatedPartialPaymentResponse = await fetch(`http://127.0.0.1:${port}/api/procurement/supplier-invoices/${matchedInvoice.id}/payments`, {
+            method: "POST",
+            headers: { ...tokenHeader, "Content-Type": "application/json" },
+            body: JSON.stringify(partialPaymentPayload),
+        });
+        assert.equal(repeatedPartialPaymentResponse.status, 200, "A retried payment request must return its original payment");
+        const repeatedPartialPayment = await repeatedPartialPaymentResponse.json() as IntegrationApiObject;
+        assert.equal(repeatedPartialPayment.payment.id, partialPaymentResult.payment.id);
+        assert.equal(await AppDataSource.getRepository(SupplierPayment).countBy({
+            supplier_invoice_id: matchedInvoice.id,
+        }), 1);
+
+        const conflictingPaymentRetryResponse = await fetch(`http://127.0.0.1:${port}/api/procurement/supplier-invoices/${matchedInvoice.id}/payments`, {
+            method: "POST",
+            headers: { ...tokenHeader, "Content-Type": "application/json" },
+            body: JSON.stringify({ ...partialPaymentPayload, amount: 21 }),
+        });
+        assert.equal(conflictingPaymentRetryResponse.status, 409, "A request key must not be reused for different payment details");
+        assert.equal(await AppDataSource.getRepository(SupplierPayment).countBy({
+            supplier_invoice_id: matchedInvoice.id,
+        }), 1);
 
         const paymentJournalEntry = await AppDataSource.getRepository(JournalEntry).findOneByOrFail({
             reference_id: partialPaymentResult.payment.id,
@@ -2963,18 +3649,158 @@ test("admin can access protected product workflow and reject unauthorized reques
         assert.equal(paymentJournalLines.reduce((sum, line) => sum + Number(line.debit), 0), 20);
         assert.equal(paymentJournalLines.reduce((sum, line) => sum + Number(line.credit), 0), 20);
         assert.ok(paymentJournalLines.some((line) => line.account.code === "2000" && Number(line.debit) === 20));
-        assert.ok(paymentJournalLines.some((line) => line.account.code === "1000" && Number(line.credit) === 20));
+        assert.ok(paymentJournalLines.some((line) => line.account.code === "1020" && Number(line.credit) === 20));
+        assert.equal(partialPaymentResult.payment.payment_date.slice(0, 10), "2026-10-04");
+
+        const supplierPaymentHistoryResponse = await fetch(`http://127.0.0.1:${port}/api/procurement/supplier-invoices/${matchedInvoice.id}/payments`, {
+            headers: tokenHeader,
+        });
+        assert.equal(supplierPaymentHistoryResponse.status, 200);
+        const supplierPaymentHistory = await supplierPaymentHistoryResponse.json() as IntegrationApiObject[];
+        assert.equal(supplierPaymentHistory.length, 1);
+        assert.equal(supplierPaymentHistory[0].payer.id, adminUserId);
 
         const finalPaymentResponse = await fetch(`http://127.0.0.1:${port}/api/procurement/supplier-invoices/${matchedInvoice.id}/payments`, {
             method: "POST",
             headers: { ...tokenHeader, "Content-Type": "application/json" },
-            body: JSON.stringify({ amount: 30, payment_method: "bank_transfer" }),
+            body: JSON.stringify({
+                amount: 30,
+                payment_method: "mpesa",
+                payment_date: "2026-10-05",
+                idempotency_key: randomUUID(),
+            }),
         });
         assert.equal(finalPaymentResponse.status, 201);
         const finalPaymentResult = await finalPaymentResponse.json() as IntegrationApiObject;
         createdSupplierPaymentIds.push(finalPaymentResult.payment.id);
         assert.equal(finalPaymentResult.invoice.status, InvoiceStatus.PAID);
         assert.equal(finalPaymentResult.invoice.balance_due, 0);
+        const mpesaPaymentJournal = await AppDataSource.getRepository(JournalEntry).findOneByOrFail({
+            reference_id: finalPaymentResult.payment.id,
+            reference_type: "SUPPLIER_PAYMENT",
+        });
+        const mpesaPaymentLines = await AppDataSource.getRepository(JournalLine).find({
+            where: { journal_entry_id: mpesaPaymentJournal.id },
+            relations: ["account"],
+        });
+        assert.ok(mpesaPaymentLines.some((line) => line.account.code === "1010" && Number(line.credit) === 30));
+
+        const manualInvoiceResponse = await fetch(`http://127.0.0.1:${port}/api/procurement/supplier-invoices`, {
+            method: "POST",
+            headers: { ...tokenHeader, "Content-Type": "application/json" },
+            body: JSON.stringify({
+                invoice_number: `PHYSICAL-${randomUUID()}`,
+                supplier_name: `Unregistered supplier ${randomUUID().slice(0, 8)}`,
+                supplier_contact_person: "Invoice Contact",
+                supplier_phone: "+254700000000",
+                invoice_date: "2026-10-06",
+                due_date: "2026-11-05",
+                subtotal: "80.00",
+                tax_amount: "12.80",
+                total_amount: "92.80",
+            }),
+        });
+        assert.equal(manualInvoiceResponse.status, 201);
+        const manualInvoice = (await manualInvoiceResponse.json() as IntegrationApiObject).invoice;
+        createdSupplierInvoiceIds.push(manualInvoice.id);
+        assert.ok(manualInvoice.vendor_id);
+        createdManualSupplierVendorId = manualInvoice.vendor_id;
+        assert.equal(manualInvoice.po_id, null);
+        assert.equal(manualInvoice.status, InvoiceStatus.PENDING);
+        assert.equal(manualInvoice.manual_reviewed_at, null);
+        const manualSupplier = await AppDataSource.getRepository(Vendor).findOneByOrFail({
+            id: createdManualSupplierVendorId,
+        });
+        assert.equal(manualSupplier.name.startsWith("Unregistered supplier "), true);
+        assert.equal(manualSupplier.needs_review, true);
+
+        const registeredManualInvoiceResponse = await fetch(`http://127.0.0.1:${port}/api/procurement/supplier-invoices`, {
+            method: "POST",
+            headers: { ...tokenHeader, "Content-Type": "application/json" },
+            body: JSON.stringify({
+                invoice_number: `REGISTERED-PHYSICAL-${randomUUID()}`,
+                vendor_id: createdVendorId,
+                invoice_date: "2026-10-06",
+                due_date: "2026-11-05",
+                subtotal: "25.00",
+                tax_amount: "4.00",
+                total_amount: "29.00",
+            }),
+        });
+        assert.equal(registeredManualInvoiceResponse.status, 201);
+        const registeredManualInvoice = (await registeredManualInvoiceResponse.json() as IntegrationApiObject).invoice;
+        createdSupplierInvoiceIds.push(registeredManualInvoice.id);
+        assert.equal(registeredManualInvoice.vendor_id, createdVendorId);
+        assert.equal(registeredManualInvoice.po_id, null);
+        assert.equal(registeredManualInvoice.status, InvoiceStatus.PENDING);
+        assert.equal(registeredManualInvoice.manual_reviewed_at, null);
+
+        const blockedManualPaymentResponse = await fetch(`http://127.0.0.1:${port}/api/procurement/supplier-invoices/${manualInvoice.id}/payments`, {
+            method: "POST",
+            headers: { ...tokenHeader, "Content-Type": "application/json" },
+            body: JSON.stringify({
+                amount: "1.00",
+                idempotency_key: randomUUID(),
+            }),
+        });
+        assert.equal(blockedManualPaymentResponse.status, 409);
+        assert.equal(await AppDataSource.getRepository(SupplierPayment).countBy({
+            supplier_invoice_id: manualInvoice.id,
+        }), 0);
+
+        const manualReviewResponse = await fetch(`http://127.0.0.1:${port}/api/procurement/supplier-invoices/${manualInvoice.id}/review`, {
+            method: "POST",
+            headers: { ...tokenHeader, "Content-Type": "application/json" },
+            body: JSON.stringify({
+                subtotal_account_id: (await AppDataSource.getRepository(Account).findOneByOrFail({ code: "5000" })).id,
+                tax_account_id: (await AppDataSource.getRepository(Account).findOneByOrFail({ code: "1400" })).id,
+            }),
+        });
+        assert.equal(manualReviewResponse.status, 200);
+        const reviewedManualInvoice = (await manualReviewResponse.json() as IntegrationApiObject).invoice;
+        assert.ok(reviewedManualInvoice.manual_reviewed_at);
+        assert.equal(reviewedManualInvoice.manual_reviewed_by, adminUserId);
+        const reviewedManualSupplier = await AppDataSource.getRepository(Vendor).findOneByOrFail({
+            id: createdManualSupplierVendorId,
+        });
+        assert.equal(reviewedManualSupplier.needs_review, true);
+        const invoiceRecognition = await AppDataSource.getRepository(JournalEntry).findOneByOrFail({
+            reference_id: manualInvoice.id,
+            reference_type: "SUPPLIER_INVOICE",
+        });
+        const invoiceRecognitionLines = await AppDataSource.getRepository(JournalLine).find({
+            where: { journal_entry_id: invoiceRecognition.id },
+            relations: ["account"],
+        });
+        assert.ok(invoiceRecognitionLines.some((line) => line.account.code === "5000" && Number(line.debit) === 80));
+        assert.ok(invoiceRecognitionLines.some((line) => line.account.code === "1400" && Number(line.debit) === 12.8));
+        assert.ok(invoiceRecognitionLines.some((line) => line.account.code === "2000" && Number(line.credit) === 92.8));
+
+        const supplierReviewBlockedPayment = await fetch(`http://127.0.0.1:${port}/api/procurement/supplier-invoices/${manualInvoice.id}/payments`, {
+            method: "POST",
+            headers: { ...tokenHeader, "Content-Type": "application/json" },
+            body: JSON.stringify({ amount: "1.00", idempotency_key: randomUUID() }),
+        });
+        assert.equal(supplierReviewBlockedPayment.status, 409);
+        const vendorReviewResponse = await fetch(`http://127.0.0.1:${port}/api/vendors/${createdManualSupplierVendorId}/review`, {
+            method: "POST",
+            headers: tokenHeader,
+        });
+        assert.equal(vendorReviewResponse.status, 200);
+
+        const manualPaymentResponse = await fetch(`http://127.0.0.1:${port}/api/procurement/supplier-invoices/${manualInvoice.id}/payments`, {
+            method: "POST",
+            headers: { ...tokenHeader, "Content-Type": "application/json" },
+            body: JSON.stringify({
+                amount: "92.80",
+                payment_method: "bank_transfer",
+                idempotency_key: randomUUID(),
+            }),
+        });
+        assert.equal(manualPaymentResponse.status, 201);
+        const manualPaymentResult = await manualPaymentResponse.json() as IntegrationApiObject;
+        createdSupplierPaymentIds.push(manualPaymentResult.payment.id);
+        assert.equal(manualPaymentResult.invoice.status, InvoiceStatus.PAID);
 
         const rejectedPurchaseOrderResponse = await fetch(`http://127.0.0.1:${port}/api/purchase-orders`, {
             method: "POST",
@@ -3269,13 +4095,15 @@ test("admin can access protected product workflow and reject unauthorized reques
             where: { po_id: createdPartialPurchaseOrderId },
         });
         assert.equal(partialDeliveryNotes.length, 2);
-        const partialReceiptMovements = await AppDataSource.getRepository(StockMovement).find({
-            where: partialDeliveryNotes.map((deliveryNote) => ({
-                product_id: createdProduct.id,
-                reference_type: "delivery_note",
-                reference_id: deliveryNote.id,
-            })),
-        });
+        const partialDeliveryNoteIds = partialDeliveryNotes.map((deliveryNote) => deliveryNote.id);
+        const partialReceiptMovements = await AppDataSource.query(`
+            SELECT movement.*
+            FROM "stock_movements" movement
+            JOIN "purchases" purchase ON purchase."id" = movement."reference_id"
+            WHERE movement."reference_type" = 'purchase'
+              AND purchase."delivery_note_id" = ANY($1::uuid[])
+              AND movement."product_id" = $2
+        `, [partialDeliveryNoteIds, createdProduct.id]) as Array<{ quantity: number }>;
         assert.equal(partialReceiptMovements.length, 2);
         assert.equal(partialReceiptMovements.reduce((sum, movement) => sum + movement.quantity, 0), 2);
 
@@ -3561,9 +4389,9 @@ test("parked sales retain the product's configured tax rate", async () => {
             items: Array<{ unit_price: number; tax_rate: number; line_total: number }>;
         };
         parkedSaleId = createdSale.id;
-        assert.equal(Number(createdSale.subtotal), 200);
-        assert.equal(Number(createdSale.tax_amount), 32);
-        assert.equal(Number(createdSale.total_amount), 212);
+        assert.equal(Number(createdSale.subtotal), 155.17);
+        assert.equal(Number(createdSale.tax_amount), 24.83);
+        assert.equal(Number(createdSale.total_amount), 180);
         assert.equal(Number(createdSale.loyalty_discount), 20);
         assert.equal(Number(createdSale.items[0].unit_price), 100);
         assert.equal(Number(createdSale.items[0].tax_rate), 16);
@@ -3625,6 +4453,567 @@ test("admin can create a customer through the API business flow", async () => {
         const createdCustomer = (await response.json()) as IntegrationApiObject;
         assert.equal(createdCustomer.name, customerPayload.name);
         assert.equal(createdCustomer.phone, customerPayload.phone);
+        const vouchers = await AppDataSource.query(`
+            SELECT voucher."voucher_number"
+            FROM "customer_vouchers" voucher
+            JOIN "customers" customer ON customer."id" = voucher."customer_id"
+            WHERE customer."phone" = $1
+        `, [customerPhone]);
+        assert.equal(vouchers.length, 1);
+        assert.equal(vouchers[0].voucher_number, "9000000001");
+    } finally {
+        await new Promise<void>((resolve, reject) => {
+            server.close((error) => (error ? reject(error) : resolve()));
+        });
+    }
+});
+
+test("admin provider fee evidence posts balanced cents and enables complete sale-period net profit", async () => {
+    const server = app.listen(0);
+    await once(server, "listening");
+    const saleId = randomUUID();
+    const saleDate = "2001-01-01";
+    const feeAdmin = await AppDataSource.getRepository(User).save(AppDataSource.getRepository(User).create({
+        email: `fee-admin-${randomUUID()}@example.com`,
+        password_hash: "integration-test-only",
+        role: AppRole.ADMIN,
+        is_active: true,
+    }));
+    const saleRepository = AppDataSource.getRepository(Sale);
+    const sale = saleRepository.create({
+        id: saleId,
+        cashier: feeAdmin,
+        subtotal: 100,
+        tax_amount: 16,
+        total_amount: 116,
+        payment_method: PaymentMethod.MPESA,
+        status: SaleStatus.COMPLETED,
+        cash_amount: 0,
+        mpesa_amount: 116,
+        payment_status: "completed",
+        loyalty_discount: 0,
+        created_at: new Date(`${saleDate}T12:00:00.000Z`),
+    });
+
+    try {
+        await saleRepository.save(sale);
+        const port = (server.address() as AddressInfo).port;
+        const token = jwt.sign(
+            { id: feeAdmin.id, email: feeAdmin.email, role: AppRole.ADMIN },
+            process.env.JWT_SECRET as string,
+            { expiresIn: "1h" },
+        );
+        const headers = {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${token}`,
+        };
+        const body = {
+            sale_id: saleId,
+            incurred_date: saleDate,
+            fee_cents: "116",
+            recoverable_vat_cents: "16",
+            statement_reference: "TEST-STATEMENT-001",
+            transaction_reference: "TEST-MPESA-001",
+        };
+        const recordResponse = await fetch(`http://127.0.0.1:${port}/api/admin/payment-fees`, {
+            method: "POST",
+            headers,
+            body: JSON.stringify(body),
+        });
+        assert.equal(recordResponse.status, 201);
+
+        const journalLines = await AppDataSource.query(`
+            SELECT account.code, line.debit::text AS debit, line.credit::text AS credit
+            FROM journal_lines line
+            JOIN journal_entries entry ON entry.id = line.journal_entry_id
+            JOIN accounts account ON account.id = line.account_id
+            WHERE entry.reference_type = 'SALE_PROCESSING_FEE' AND entry.reference_id = $1
+            ORDER BY account.code
+        `, [saleId]);
+        assert.deepEqual(journalLines, [
+            { code: "1010", debit: "0.00", credit: "1.16" },
+            { code: "1400", debit: "0.16", credit: "0.00" },
+            { code: "5200", debit: "1.00", credit: "0.00" },
+        ]);
+
+        const duplicateResponse = await fetch(`http://127.0.0.1:${port}/api/admin/payment-fees`, {
+            method: "POST",
+            headers,
+            body: JSON.stringify(body),
+        });
+        assert.equal(duplicateResponse.status, 409);
+
+        const correctionResponse = await fetch(
+            `http://127.0.0.1:${port}/api/admin/payment-fees/${saleId}/corrections`,
+            {
+                method: "POST",
+                headers,
+                body: JSON.stringify({
+                    incurred_date: saleDate,
+                    fee_cents: "232",
+                    recoverable_vat_cents: "32",
+                    statement_reference: "TEST-STATEMENT-CORRECTION-001",
+                    transaction_reference: "TEST-MPESA-001",
+                    reason: "Provider statement amount was transcribed incorrectly",
+                }),
+            },
+        );
+        const correctionBody = await correctionResponse.text();
+        assert.equal(correctionResponse.status, 201, correctionBody);
+
+        const correctionRows = await AppDataSource.query(`
+            SELECT id, revision, fee_cents::text AS fee_cents, recoverable_vat_cents::text AS recoverable_vat_cents,
+                   reason, reversal_journal_entry_id, corrected_journal_entry_id
+            FROM sale_processing_fee_corrections
+            WHERE fee_id = (SELECT id FROM sale_processing_fees WHERE sale_id = $1)
+        `, [saleId]);
+        assert.equal(correctionRows.length, 1);
+        assert.equal(correctionRows[0].revision, 1);
+        assert.equal(correctionRows[0].fee_cents, "232");
+        assert.equal(correctionRows[0].recoverable_vat_cents, "32");
+        assert.equal(correctionRows[0].reason, "Provider statement amount was transcribed incorrectly");
+        assert.ok(correctionRows[0].reversal_journal_entry_id);
+        assert.ok(correctionRows[0].corrected_journal_entry_id);
+        await assert.rejects(
+            AppDataSource.query(
+                `UPDATE sale_processing_fee_corrections SET reason = 'tampered' WHERE id = $1`,
+                [correctionRows[0].id],
+            ),
+            /immutable/,
+        );
+        const correctionJournalRows = await AppDataSource.query(`
+            SELECT entry.reference_type, account.code, line.debit::text AS debit, line.credit::text AS credit
+            FROM journal_entries entry
+            JOIN journal_lines line ON line.journal_entry_id = entry.id
+            JOIN accounts account ON account.id = line.account_id
+            WHERE entry.reference_id = $1
+              AND entry.reference_type IN (
+                  'SALE_PROCESSING_FEE_CORRECTION_REVERSAL',
+                  'SALE_PROCESSING_FEE_CORRECTION'
+              )
+            ORDER BY entry.reference_type, account.code
+        `, [saleId]);
+        assert.deepEqual(correctionJournalRows, [
+            { reference_type: "SALE_PROCESSING_FEE_CORRECTION", code: "1010", debit: "0.00", credit: "2.32" },
+            { reference_type: "SALE_PROCESSING_FEE_CORRECTION", code: "1400", debit: "0.32", credit: "0.00" },
+            { reference_type: "SALE_PROCESSING_FEE_CORRECTION", code: "5200", debit: "2.00", credit: "0.00" },
+            { reference_type: "SALE_PROCESSING_FEE_CORRECTION_REVERSAL", code: "1010", debit: "1.16", credit: "0.00" },
+            { reference_type: "SALE_PROCESSING_FEE_CORRECTION_REVERSAL", code: "1400", debit: "0.00", credit: "0.16" },
+            { reference_type: "SALE_PROCESSING_FEE_CORRECTION_REVERSAL", code: "5200", debit: "0.00", credit: "1.00" },
+        ]);
+        const correctedFeeListResponse = await fetch(
+            `http://127.0.0.1:${port}/api/admin/payment-fees?start_date=${saleDate}&end_date=${saleDate}`,
+            { headers: { Authorization: `Bearer ${token}` } },
+        );
+        assert.equal(correctedFeeListResponse.status, 200);
+        const correctedFeeList = await correctedFeeListResponse.json() as {
+            fees: Array<{ fee_cents: string; recoverable_vat_cents: string; revision: number }>;
+        };
+        assert.deepEqual(correctedFeeList.fees.map(({ fee_cents, recoverable_vat_cents, revision }) => ({
+            fee_cents, recoverable_vat_cents, revision,
+        })), [{ fee_cents: "232", recoverable_vat_cents: "32", revision: 1 }]);
+
+        const summaryResponse = await fetch(
+            `http://127.0.0.1:${port}/api/reports/summary?start=${saleDate}&end=2001-01-02`,
+            { headers: { Authorization: `Bearer ${token}` } },
+        );
+        const summaryBody = await summaryResponse.text();
+        assert.equal(summaryResponse.status, 200, summaryBody);
+        const summary = JSON.parse(summaryBody) as {
+            profitAndLoss: { transactionCostsCents: string | null; netProfitCents: string | null };
+            comparison: {
+                currentSalesCents: string;
+                previousSalesCents: string;
+                salesChangeCents: string;
+                salesChangePercentBasisPoints: string | null;
+            };
+            salesByPayment: Array<{ totalCents: string }>;
+            salesTrend: Array<{ salesCents: string; refundsCents: string }>;
+            salesByHour: Array<{ salesCents: string; refundsCents: string }>;
+            salesByWeekday: Array<{ salesCents: string; refundsCents: string }>;
+            salesHeatmap: Array<{ hours: Array<{ salesCents: string; refundsCents: string }> }>;
+            topProducts: Array<{
+                revenueCents?: string | null;
+                costOfGoodsSoldCents?: string | null;
+                grossProfitCents?: string | null;
+            }>;
+            cashierPerformance?: Array<{
+                totalCents: string;
+                discountsCents: string;
+                refundsCents: string;
+                profitContributionCents: string | null;
+            }>;
+        };
+        assert.equal(summary.profitAndLoss.transactionCostsCents, "100");
+        assert.equal(summary.profitAndLoss.netProfitCents, "9900");
+        assert.equal(summary.comparison.currentSalesCents, "11600");
+        assert.equal(summary.comparison.previousSalesCents, "0");
+        assert.equal(summary.comparison.salesChangeCents, "11600");
+        assert.equal(summary.comparison.salesChangePercentBasisPoints, null);
+        const centsPattern = /^-?\d+$/;
+        assert.ok(summary.salesByPayment.length > 0);
+        assert.ok(summary.salesByPayment.every((row) => centsPattern.test(row.totalCents)));
+        assert.ok(summary.salesTrend.every((row) => centsPattern.test(row.salesCents) && centsPattern.test(row.refundsCents)));
+        assert.ok(summary.salesByHour.every((row) => centsPattern.test(row.salesCents) && centsPattern.test(row.refundsCents)));
+        assert.ok(summary.salesByWeekday.every((row) => centsPattern.test(row.salesCents) && centsPattern.test(row.refundsCents)));
+        assert.ok(summary.salesHeatmap.every((day) => day.hours.every((row) =>
+            centsPattern.test(row.salesCents) && centsPattern.test(row.refundsCents),
+        )));
+        assert.ok(summary.topProducts.every((row) =>
+            [row.revenueCents, row.costOfGoodsSoldCents, row.grossProfitCents]
+                .every((value) => value == null || centsPattern.test(value)),
+        ));
+        assert.ok(summary.cashierPerformance?.every((row) =>
+            [row.totalCents, row.discountsCents, row.refundsCents, row.profitContributionCents]
+                .every((value) => value == null || centsPattern.test(value)),
+        ));
+    } finally {
+        await new Promise<void>((resolve, reject) => {
+            server.close((error) => (error ? reject(error) : resolve()));
+        });
+    }
+});
+
+test("admin can close a balanced costing period and the close is immutable", async () => {
+    const server = app.listen(0);
+    await once(server, "listening");
+
+    try {
+        const todayUtc = new Date().toISOString().slice(0, 10);
+        const periodEnd = new Date(`${todayUtc}T00:00:00.000Z`);
+        periodEnd.setUTCDate(periodEnd.getUTCDate() - 1);
+        const endDate = periodEnd.toISOString().slice(0, 10);
+        periodEnd.setUTCDate(periodEnd.getUTCDate() - 1);
+        const baselineAt = periodEnd.toISOString();
+
+        const warehouse = await AppDataSource.getRepository(Warehouse).save({
+            name: `Costing Baseline ${randomUUID()}`,
+            is_active: true,
+            is_main: false,
+        });
+        const productRepository = AppDataSource.getRepository(Product);
+        const product = productRepository.create({
+            sku: `COSTING-BASELINE-${randomUUID()}`,
+            name: "Costing baseline inventory",
+            unit_cost: 45,
+            retail_price: 116,
+            stock_on_hand: 5,
+        });
+        await productRepository.save(product);
+        await AppDataSource.getRepository(WarehouseStock).save({
+            warehouse_id: warehouse.id,
+            product_id: product.id,
+            stock_on_hand: 5,
+            stock_value_cents: "22500",
+        });
+
+        assert.equal(await InventoryService.initializeCostingBaseline(AppDataSource.manager), true);
+        await AppDataSource.query(`ALTER TABLE "stock_movements" DISABLE TRIGGER USER`);
+        try {
+            await AppDataSource.query(`
+                UPDATE "stock_movements"
+                SET "created_at" = $1::timestamptz - INTERVAL '1 millisecond'
+                WHERE "movement_type" <> 'costing_opening_balance'
+            `, [baselineAt]);
+            await AppDataSource.query(`
+                UPDATE "inventory_costing_baselines"
+                SET "created_at" = $1::timestamptz,
+                    "valuation_method" = 'legacy_product_unit_cost_snapshot'
+                WHERE "id" = 1
+            `, [baselineAt]);
+            await AppDataSource.query(`
+                UPDATE "stock_movements"
+                SET "created_at" = $1::timestamptz
+                WHERE "movement_type" = 'costing_opening_balance'
+            `, [baselineAt]);
+        } finally {
+            await AppDataSource.query(`ALTER TABLE "stock_movements" ENABLE TRIGGER USER`);
+        }
+        const openingMovement = await AppDataSource.query(`
+            SELECT "quantity", "value_change_cents"::text AS "value_change_cents"
+            FROM "stock_movements"
+            WHERE "movement_type" = 'costing_opening_balance'
+              AND "product_id" = $1
+        `, [product.id]);
+        assert.equal(openingMovement.length, 1);
+        assert.equal(openingMovement[0].quantity, 5);
+        assert.equal(openingMovement[0].value_change_cents, "22500");
+        let valuationTotals = await AppDataSource.query(`
+            SELECT
+                COALESCE((SELECT SUM("stock_value_cents") FROM "warehouse_stocks"), 0)::text AS "stock_value_cents",
+                COALESCE((
+                    SELECT SUM("value_change_cents")
+                    FROM "stock_movements"
+                    WHERE "movement_type" = 'costing_opening_balance'
+                ), 0)::text AS "opening_value_cents"
+        `);
+        assert.equal(
+            valuationTotals[0].opening_value_cents,
+            valuationTotals[0].stock_value_cents,
+            "Opening balance movements must represent the complete valued stock snapshot",
+        );
+
+        const port = (server.address() as AddressInfo).port;
+        const token = jwt.sign(
+            { id: adminUserId, email: adminEmail, role: AppRole.ADMIN },
+            process.env.JWT_SECRET as string,
+            { expiresIn: "1h" },
+        );
+        const costingReportResponse = await fetch(
+            `http://127.0.0.1:${port}/api/reports/costing?start_date=${endDate}&end_date=${endDate}`,
+            { headers: { Authorization: `Bearer ${token}` } },
+        );
+        assert.equal(costingReportResponse.status, 200);
+        const costingReport = await costingReportResponse.json() as {
+            stock_value_verified: boolean;
+            profitability: {
+                overall: Array<{
+                    data_complete: boolean;
+                    missing_vat_count: number;
+                }>;
+            };
+            supplier_profitability: {
+                available: boolean;
+                by_supplier: unknown[];
+            };
+            reconciliation: {
+                available: boolean;
+                message: string;
+            };
+        };
+        assert.equal(costingReport.stock_value_verified, false);
+        assert.equal(costingReport.reconciliation.available, false);
+        assert.match(costingReport.reconciliation.message, /unverified/i);
+        assert.ok(Number.isInteger(costingReport.profitability.overall[0]?.missing_vat_count));
+        assert.equal(costingReport.supplier_profitability.available, true);
+        assert.ok(Array.isArray(costingReport.supplier_profitability.by_supplier));
+
+        const blockedCloseResponse = await fetch(`http://127.0.0.1:${port}/api/reports/costing/closes`, {
+            method: "POST",
+            headers: {
+                "Content-Type": "application/json",
+                Authorization: `Bearer ${token}`,
+            },
+            body: JSON.stringify({ end_date: endDate }),
+        });
+        assert.equal(blockedCloseResponse.status, 400);
+        assert.match((await blockedCloseResponse.json() as IntegrationApiObject).message, /unverified legacy product costs/i);
+
+        await AppDataSource.query(`
+            UPDATE "products" product
+            SET "stock_on_hand" = COALESCE(stock.quantity, 0)
+            FROM (
+                SELECT product_record."id",
+                    COALESCE(SUM(stock_record."stock_on_hand"), 0)::int AS quantity
+                FROM "products" product_record
+                LEFT JOIN "warehouse_stocks" stock_record
+                    ON stock_record."product_id" = product_record."id"
+                GROUP BY product_record."id"
+            ) stock
+            WHERE product."id" = stock."id"
+              AND product."stock_on_hand" <> stock.quantity
+        `);
+        const previewResponse = await fetch(
+            `http://127.0.0.1:${port}/api/admin/costing-baseline-verification`,
+            { headers: { Authorization: `Bearer ${token}` } },
+        );
+        assert.equal(previewResponse.status, 200);
+        const preview = await previewResponse.json() as {
+            rows: Array<{
+                warehouse_stock_id: string;
+                warehouse_id: string;
+                product_id: string;
+                quantity: number;
+                current_value_cents: string | null;
+            }>;
+        };
+        const targetLine = preview.rows.find(
+            (row) => row.product_id === product.id && row.warehouse_id === warehouse.id,
+        );
+        assert.ok(targetLine);
+        const targetValueCents = "24000";
+        const verificationRows = preview.rows.map((row) => {
+            assert.notEqual(row.current_value_cents, null, "Opening verification needs complete current book values");
+            return {
+                warehouse_stock_id: row.warehouse_stock_id,
+                counted_quantity: row.quantity,
+                valuation_cents: row === targetLine ? targetValueCents : row.current_value_cents as string,
+            };
+        });
+        const verificationResponse = await fetch(
+            `http://127.0.0.1:${port}/api/admin/costing-baseline-verification`,
+            {
+                method: "POST",
+                headers: {
+                    "Content-Type": "application/json",
+                    Authorization: `Bearer ${token}`,
+                },
+                body: JSON.stringify({
+                    evidence_reference: "TEST-STOCKTAKE-001",
+                    reason: "Integration stocktake valuation verification",
+                    physical_counts_confirmed: true,
+                    rows: verificationRows,
+                }),
+            },
+        );
+        const verificationResponseText = await verificationResponse.text();
+        assert.equal(verificationResponse.status, 201, verificationResponseText);
+        const verification = JSON.parse(verificationResponseText) as {
+            verification_id: string;
+            line_count: number;
+            total_value_cents: string;
+        };
+        assert.equal(verification.line_count, preview.rows.length);
+        const revisedStock = await AppDataSource.query(`
+            SELECT "stock_value_cents"::text AS "stock_value_cents"
+            FROM "warehouse_stocks"
+            WHERE "warehouse_id" = $1 AND "product_id" = $2
+        `, [warehouse.id, product.id]);
+        assert.equal(revisedStock[0].stock_value_cents, targetValueCents);
+        const verificationAudit = await AppDataSource.query(`
+            SELECT "evidence_reference", "verified_by", "total_value_cents"::text AS "total_value_cents",
+                jsonb_array_length("stock_snapshot") AS snapshot_lines
+            FROM "inventory_costing_baseline_verifications"
+            WHERE "id" = $1
+        `, [verification.verification_id]);
+        assert.equal(verificationAudit[0].evidence_reference, "TEST-STOCKTAKE-001");
+        assert.equal(verificationAudit[0].verified_by, adminUserId);
+        assert.equal(verificationAudit[0].snapshot_lines, preview.rows.length);
+        assert.equal(verificationAudit[0].total_value_cents, verification.total_value_cents);
+        await assert.rejects(
+            AppDataSource.query(
+                `UPDATE "inventory_costing_baseline_verifications" SET "reason" = 'tampered' WHERE "id" = $1`,
+                [verification.verification_id],
+            ),
+            /Costing baseline verification records are immutable/,
+        );
+
+        await AppDataSource.query(`ALTER TABLE "stock_movements" DISABLE TRIGGER USER`);
+        try {
+            await AppDataSource.query(`
+                UPDATE "stock_movements"
+                SET "value_change_cents" = 0, "quantity" = 0,
+                    "quantity_before" = 0, "quantity_after" = 0,
+                    "created_at" = $1::timestamptz
+                WHERE "movement_type" = 'costing_opening_balance'
+                  AND "reference_type" = 'costing_opening_balance'
+            `, [baselineAt]);
+            await AppDataSource.query(`
+                UPDATE "stock_movements"
+                SET "created_at" = $1::timestamptz
+                WHERE "movement_type" = 'costing_opening_balance'
+                  AND "reference_type" = 'costing_baseline_verification'
+            `, [baselineAt]);
+            await AppDataSource.query(`
+                UPDATE "stock_movements"
+                SET "created_at" = $1::timestamptz - INTERVAL '1 millisecond'
+                WHERE "movement_type" <> 'costing_opening_balance'
+            `, [baselineAt]);
+            await AppDataSource.query(`
+                UPDATE "inventory_costing_baselines"
+                SET "created_at" = $1::timestamptz
+                WHERE "id" = 1
+            `, [baselineAt]);
+        } finally {
+            await AppDataSource.query(`ALTER TABLE "stock_movements" ENABLE TRIGGER USER`);
+        }
+
+        const verifiedOpeningMovement = await AppDataSource.query(`
+            SELECT "quantity", "value_change_cents"::text AS "value_change_cents"
+            FROM "stock_movements"
+            WHERE "movement_type" = 'costing_opening_balance'
+              AND "reference_type" = 'costing_baseline_verification'
+              AND "product_id" = $1
+        `, [product.id]);
+        assert.equal(verifiedOpeningMovement.length, 1);
+        assert.equal(verifiedOpeningMovement[0].quantity, 5);
+        assert.equal(verifiedOpeningMovement[0].value_change_cents, targetValueCents);
+        valuationTotals = await AppDataSource.query(`
+            SELECT
+                COALESCE((SELECT SUM("stock_value_cents") FROM "warehouse_stocks"), 0)::text AS "stock_value_cents",
+                COALESCE((
+                    SELECT SUM("value_change_cents")
+                    FROM "stock_movements"
+                    WHERE "movement_type" = 'costing_opening_balance'
+                ), 0)::text AS "opening_value_cents"
+        `);
+        assert.equal(
+            valuationTotals[0].opening_value_cents,
+            valuationTotals[0].stock_value_cents,
+            "The verified opening snapshot must exactly represent current warehouse stock value",
+        );
+
+        const verifiedReportResponse = await fetch(
+            `http://127.0.0.1:${port}/api/reports/costing?start_date=${endDate}&end_date=${endDate}`,
+            { headers: { Authorization: `Bearer ${token}` } },
+        );
+        assert.equal(verifiedReportResponse.status, 200);
+        const verifiedReport = await verifiedReportResponse.json() as {
+            stock_value_verified: boolean;
+            reconciliation: { baseline_verified?: boolean };
+        };
+        assert.equal(verifiedReport.stock_value_verified, true);
+        assert.equal(verifiedReport.reconciliation.baseline_verified, true);
+
+        const response = await fetch(`http://127.0.0.1:${port}/api/reports/costing/closes`, {
+            method: "POST",
+            headers: {
+                "Content-Type": "application/json",
+                Authorization: `Bearer ${token}`,
+            },
+            body: JSON.stringify({ end_date: endDate }),
+        });
+
+        assert.equal(response.status, 201);
+        const close = await response.json() as {
+            period_end_date: string;
+            opening_value_cents: string;
+            purchase_value_cents: string;
+            cogs_cents: string;
+            write_offs_cents: string;
+            adjustments_cents: string;
+            closing_value_cents: string;
+        };
+        assert.equal(close.period_end_date.slice(0, 10), endDate);
+        assert.equal(close.opening_value_cents, valuationTotals[0].stock_value_cents);
+        assert.equal(close.purchase_value_cents, "0");
+        assert.equal(close.cogs_cents, "0");
+        assert.equal(close.write_offs_cents, "0");
+        assert.equal(close.adjustments_cents, "0");
+        assert.equal(close.closing_value_cents, valuationTotals[0].stock_value_cents);
+
+        const historyResponse = await fetch(`http://127.0.0.1:${port}/api/reports/costing/closes`, {
+            headers: { Authorization: `Bearer ${token}` },
+        });
+        assert.equal(historyResponse.status, 200);
+        const closes = await historyResponse.json() as Array<{ period_end_date: string }>;
+        assert.ok(closes.some((record) => record.period_end_date === endDate));
+
+        const duplicateResponse = await fetch(`http://127.0.0.1:${port}/api/reports/costing/closes`, {
+            method: "POST",
+            headers: {
+                "Content-Type": "application/json",
+                Authorization: `Bearer ${token}`,
+            },
+            body: JSON.stringify({ end_date: endDate }),
+        });
+        assert.equal(duplicateResponse.status, 409);
+        await assert.rejects(
+            AppDataSource.query(
+                `UPDATE "inventory_period_closes" SET "closing_value_cents" = 1 WHERE "period_end_date" = $1::date`,
+                [endDate],
+            ),
+            /Inventory period closes are immutable/,
+        );
+        const blockedBaselineVerification = await fetch(
+            `http://127.0.0.1:${port}/api/admin/costing-baseline-verification`,
+            { headers: { Authorization: `Bearer ${token}` } },
+        );
+        assert.equal(blockedBaselineVerification.status, 409);
+        assert.match(
+            (await blockedBaselineVerification.json() as IntegrationApiObject).message,
+            /period has already been closed/i,
+        );
     } finally {
         await new Promise<void>((resolve, reject) => {
             server.close((error) => (error ? reject(error) : resolve()));
@@ -4032,6 +5421,123 @@ test("supplier invoice uniqueness migration rejects legacy duplicates and can be
             [schemaName, "IDX_supplier_invoice_vendor_number"]
         );
         assert.equal(revertedIndexes.length, 0);
+    } finally {
+        if (queryRunner.isTransactionActive) {
+            await queryRunner.rollbackTransaction();
+        }
+        await queryRunner.release();
+    }
+});
+
+test("supplier payment idempotency migration allows legacy rows and prevents duplicate request keys", async () => {
+    const queryRunner = AppDataSource.createQueryRunner();
+    const schemaName = `supplier_payment_migration_${randomUUID().replace(/-/g, "")}`;
+    await queryRunner.connect();
+    await queryRunner.startTransaction();
+
+    try {
+        await queryRunner.query(`CREATE SCHEMA "${schemaName}"`);
+        await queryRunner.query(`SET LOCAL search_path TO "${schemaName}"`);
+        await queryRunner.query(`CREATE TABLE "supplier_payments" ("id" uuid PRIMARY KEY)`);
+        await queryRunner.query(`
+            INSERT INTO "supplier_payments" ("id") VALUES
+                ('00000000-0000-0000-0000-000000000061'),
+                ('00000000-0000-0000-0000-000000000062')
+        `);
+
+        const migration = new AddSupplierPaymentIdempotency1792410000000();
+        await migration.up(queryRunner);
+        await migration.up(queryRunner);
+        await queryRunner.query(`
+            UPDATE "supplier_payments"
+            SET "idempotency_key" = '00000000-0000-4000-8000-000000000063'
+            WHERE "id" = '00000000-0000-0000-0000-000000000061'
+        `);
+        await queryRunner.query("SAVEPOINT duplicate_supplier_payment_key");
+        await assert.rejects(
+            queryRunner.query(`
+                UPDATE "supplier_payments"
+                SET "idempotency_key" = '00000000-0000-4000-8000-000000000063'
+                WHERE "id" = '00000000-0000-0000-0000-000000000062'
+            `),
+            /duplicate key/i,
+        );
+        await queryRunner.query("ROLLBACK TO SAVEPOINT duplicate_supplier_payment_key");
+        const legacyNullCount = await queryRunner.query(`
+            SELECT count(*)::integer AS count
+            FROM "supplier_payments"
+            WHERE "idempotency_key" IS NULL
+        `);
+        assert.equal(legacyNullCount[0].count, 1);
+
+        await migration.down(queryRunner);
+        const remainingColumn = await queryRunner.query(
+            `SELECT column_name FROM information_schema.columns
+             WHERE table_schema = $1 AND table_name = 'supplier_payments' AND column_name = 'idempotency_key'`,
+            [schemaName],
+        );
+        assert.equal(remainingColumn.length, 0);
+    } finally {
+        if (queryRunner.isTransactionActive) {
+            await queryRunner.rollbackTransaction();
+        }
+        await queryRunner.release();
+    }
+});
+
+test("manual supplier invoice migration supports nullable purchase orders and protects invoice history on rollback", async () => {
+    const queryRunner = AppDataSource.createQueryRunner();
+    const schemaName = `manual_supplier_invoice_migration_${randomUUID().replace(/-/g, "")}`;
+    await queryRunner.connect();
+    await queryRunner.startTransaction();
+
+    try {
+        await queryRunner.query(`CREATE SCHEMA "${schemaName}"`);
+        await queryRunner.query(`SET LOCAL search_path TO "${schemaName}"`);
+        await queryRunner.query(`CREATE TABLE "vendors" ("id" uuid PRIMARY KEY)`);
+        await queryRunner.query(`CREATE TABLE "supplier_invoices" ("id" uuid PRIMARY KEY, "po_id" uuid NOT NULL)`);
+
+        const migration = new AddManualSupplierInvoices1792420000000();
+        await migration.up(queryRunner);
+        await migration.up(queryRunner);
+
+        const nullablePoColumn = await queryRunner.query(`
+            SELECT is_nullable FROM information_schema.columns
+            WHERE table_schema = $1 AND table_name = 'supplier_invoices' AND column_name = 'po_id'
+        `, [schemaName]);
+        assert.equal(nullablePoColumn[0].is_nullable, "YES");
+        const newInvoiceColumns = await queryRunner.query(`
+            SELECT column_name FROM information_schema.columns
+            WHERE table_schema = $1 AND table_name = 'supplier_invoices'
+              AND column_name IN ('manual_reviewed_at', 'manual_reviewed_by')
+        `, [schemaName]);
+        assert.equal(newInvoiceColumns.length, 2);
+        const newVendorColumns = await queryRunner.query(`
+            SELECT column_name FROM information_schema.columns
+            WHERE table_schema = $1 AND table_name = 'vendors'
+              AND column_name IN ('needs_review', 'reviewed_at', 'reviewed_by')
+        `, [schemaName]);
+        assert.equal(newVendorColumns.length, 3);
+
+        await queryRunner.query(`
+            INSERT INTO "supplier_invoices" ("id", "po_id")
+            VALUES ('00000000-0000-0000-0000-000000000071', NULL)
+        `);
+        await assert.rejects(migration.down(queryRunner), /unlinked invoices exist/i);
+        await queryRunner.query(`DELETE FROM "supplier_invoices"`);
+        await migration.down(queryRunner);
+
+        const restoredPoColumn = await queryRunner.query(`
+            SELECT is_nullable FROM information_schema.columns
+            WHERE table_schema = $1 AND table_name = 'supplier_invoices' AND column_name = 'po_id'
+        `, [schemaName]);
+        assert.equal(restoredPoColumn[0].is_nullable, "NO");
+        const revertedColumns = await queryRunner.query(`
+            SELECT column_name FROM information_schema.columns
+            WHERE table_schema = $1 AND table_name = 'supplier_invoices'
+              AND column_name IN ('manual_reviewed_at', 'manual_reviewed_by')
+        `, [schemaName]);
+        assert.equal(revertedColumns.length, 0);
     } finally {
         if (queryRunner.isTransactionActive) {
             await queryRunner.rollbackTransaction();

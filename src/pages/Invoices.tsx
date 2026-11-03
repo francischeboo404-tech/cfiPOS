@@ -7,6 +7,11 @@ import { Plus, FileText, Search, Eye, CreditCard, Printer } from "lucide-react";
 import { toast } from "sonner";
 import { ApiService } from "@/lib/api";
 import {
+  centsToKesString,
+  formatKesCents,
+  parseKesToCents,
+} from "@/lib/exactMoney";
+import {
   Table,
   TableBody,
   TableCell,
@@ -21,6 +26,7 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { Label } from "@/components/ui/label";
+import { useCompanyBranding } from "@/hooks/useCompanyBranding";
 import {
   Select,
   SelectContent,
@@ -35,12 +41,12 @@ interface Invoice {
   invoice_number: string;
   customer_id: string | null;
   sale_id: string | null;
-  subtotal: number;
-  tax_amount: number;
-  discount_amount: number;
-  total_amount: number;
-  paid_amount: number;
-  balance_due: number;
+  subtotal: number | string;
+  tax_amount: number | string;
+  discount_amount: number | string;
+  total_amount: number | string;
+  paid_amount: number | string;
+  balance_due: number | string;
   status: string;
   due_date: string | null;
   issued_at: string | null;
@@ -51,7 +57,7 @@ interface Invoice {
 
 interface InvoicePayment {
   id: string;
-  amount: number;
+  amount: number | string;
   payment_method: string;
   reference_number: string | null;
   created_at: string;
@@ -59,16 +65,11 @@ interface InvoicePayment {
 
 const normalizeInvoice = (invoice: Invoice): Invoice => ({
   ...invoice,
-  subtotal: Number(invoice.subtotal) || 0,
-  tax_amount: Number(invoice.tax_amount) || 0,
-  discount_amount: Number(invoice.discount_amount) || 0,
-  total_amount: Number(invoice.total_amount) || 0,
-  paid_amount: Number(invoice.paid_amount) || 0,
-  balance_due: Number(invoice.balance_due) || 0,
   customers: invoice.customer ?? invoice.customers ?? null,
 });
 
 export default function Invoices() {
+  const { company_name } = useCompanyBranding();
   const [invoices, setInvoices] = useState<Invoice[]>([]);
   const [searchTerm, setSearchTerm] = useState("");
   const [statusFilter, setStatusFilter] = useState<string>("all");
@@ -128,20 +129,26 @@ export default function Invoices() {
   const handleRecordPayment = async () => {
     if (!selectedInvoice) return;
 
-    const amount = parseFloat(paymentForm.amount);
-    if (isNaN(amount) || amount <= 0) {
-      toast.error("Please enter a valid amount");
+    let amountCents: number;
+    try {
+      amountCents = parseKesToCents(paymentForm.amount);
+    } catch {
+      toast.error("Enter a positive KES amount with at most two decimal places");
+      return;
+    }
+    if (amountCents <= 0) {
+      toast.error("Payment amount must be greater than zero");
       return;
     }
 
-    if (amount > selectedInvoice.balance_due) {
+    if (amountCents > parseKesToCents(String(selectedInvoice.balance_due))) {
       toast.error("Payment amount exceeds balance due");
       return;
     }
 
     try {
       await ApiService.post(`/invoices/${selectedInvoice.id}/payments`, {
-        amount,
+        amount: centsToKesString(amountCents),
         payment_method: paymentForm.payment_method,
         reference_number: paymentForm.reference_number || null,
       });
@@ -192,6 +199,7 @@ export default function Invoices() {
   );
 
   return (
+    <>
     <div className="p-6 space-y-6">
       <div className="flex flex-col sm:flex-row sm:justify-between sm:items-center gap-4">
         <div>
@@ -291,28 +299,25 @@ export default function Invoices() {
                       {invoice.customers?.name || "Walk-in"}
                     </TableCell>
                     <TableCell>
-                      KSh{" "}
-                      {invoice.total_amount.toLocaleString("en-KE", {
-                        minimumFractionDigits: 2,
-                      })}
+                      {formatKesCents(
+                        parseKesToCents(String(invoice.total_amount)),
+                      )}
                     </TableCell>
                     <TableCell className="text-green-600">
-                      KSh{" "}
-                      {invoice.paid_amount.toLocaleString("en-KE", {
-                        minimumFractionDigits: 2,
-                      })}
+                      {formatKesCents(
+                        parseKesToCents(String(invoice.paid_amount)),
+                      )}
                     </TableCell>
                     <TableCell
                       className={
-                        invoice.balance_due > 0
+                        parseKesToCents(String(invoice.balance_due)) > 0
                           ? "text-destructive font-medium"
                           : ""
                       }
                     >
-                      KSh{" "}
-                      {invoice.balance_due.toLocaleString("en-KE", {
-                        minimumFractionDigits: 2,
-                      })}
+                      {formatKesCents(
+                        parseKesToCents(String(invoice.balance_due)),
+                      )}
                     </TableCell>
                     <TableCell>
                       <Badge
@@ -333,7 +338,7 @@ export default function Invoices() {
                       >
                         <Eye className="h-4 w-4" />
                       </Button>
-                      {invoice.balance_due > 0 &&
+                      {parseKesToCents(String(invoice.balance_due)) > 0 &&
                         invoice.status !== "cancelled" && (
                           <Button
                             size="sm"
@@ -389,21 +394,19 @@ export default function Invoices() {
                 <div>
                   <p className="text-sm text-muted-foreground">Total Amount</p>
                   <p className="font-bold text-lg">
-                    KSh{" "}
-                    {selectedInvoice.total_amount.toLocaleString("en-KE", {
-                      minimumFractionDigits: 2,
-                    })}
+                    {formatKesCents(
+                      parseKesToCents(String(selectedInvoice.total_amount)),
+                    )}
                   </p>
                 </div>
                 <div>
                   <p className="text-sm text-muted-foreground">Balance Due</p>
                   <p
-                    className={`font-bold text-lg ${selectedInvoice.balance_due > 0 ? "text-destructive" : "text-green-600"}`}
+                    className={`font-bold text-lg ${parseKesToCents(String(selectedInvoice.balance_due)) > 0 ? "text-destructive" : "text-green-600"}`}
                   >
-                    KSh{" "}
-                    {selectedInvoice.balance_due.toLocaleString("en-KE", {
-                      minimumFractionDigits: 2,
-                    })}
+                    {formatKesCents(
+                      parseKesToCents(String(selectedInvoice.balance_due)),
+                    )}
                   </p>
                 </div>
               </div>
@@ -434,10 +437,7 @@ export default function Invoices() {
                             )}
                           </TableCell>
                           <TableCell className="text-green-600 font-medium">
-                            KSh{" "}
-                            {payment.amount.toLocaleString("en-KE", {
-                              minimumFractionDigits: 2,
-                            })}
+                            {formatKesCents(parseKesToCents(String(payment.amount)))}
                           </TableCell>
                           <TableCell className="capitalize">
                             {payment.payment_method}
@@ -457,7 +457,7 @@ export default function Invoices() {
                   <Printer className="h-4 w-4 mr-2" />
                   Print
                 </Button>
-                {selectedInvoice.balance_due > 0 &&
+                {parseKesToCents(String(selectedInvoice.balance_due)) > 0 &&
                   selectedInvoice.status !== "cancelled" && (
                     <Button onClick={() => setPaymentDialogOpen(true)}>
                       <CreditCard className="h-4 w-4 mr-2" />
@@ -481,10 +481,9 @@ export default function Invoices() {
               <div className="p-4 bg-muted rounded-lg">
                 <p className="text-sm text-muted-foreground">Balance Due</p>
                 <p className="text-2xl font-bold text-primary">
-                  KSh{" "}
-                  {selectedInvoice.balance_due.toLocaleString("en-KE", {
-                    minimumFractionDigits: 2,
-                  })}
+                  {formatKesCents(
+                    parseKesToCents(String(selectedInvoice.balance_due)),
+                  )}
                 </p>
               </div>
 
@@ -553,6 +552,161 @@ export default function Invoices() {
           )}
         </DialogContent>
       </Dialog>
+      <section id="invoice-print-area" aria-hidden="true">
+        <style>{`
+          #invoice-print-area { display: none; }
+          @page { size: A4 portrait; margin: 14mm; }
+          @media print {
+            body * { visibility: hidden !important; }
+            #invoice-print-area, #invoice-print-area * { visibility: visible !important; }
+            #invoice-print-area {
+              display: block !important;
+              position: fixed;
+              inset: 0;
+              box-sizing: border-box;
+              width: 100%;
+              padding: 0;
+              color: #111;
+              background: #fff;
+              font-family: Arial, sans-serif;
+              font-size: 12px;
+              line-height: 1.45;
+              -webkit-print-color-adjust: exact;
+              print-color-adjust: exact;
+            }
+            #invoice-print-area h1, #invoice-print-area h2, #invoice-print-area p { margin: 0; }
+            #invoice-print-area .invoice-print-header {
+              display: flex;
+              justify-content: space-between;
+              gap: 24px;
+              padding-bottom: 18px;
+              border-bottom: 2px solid #222;
+            }
+            #invoice-print-area .invoice-print-title { font-size: 26px; font-weight: 700; }
+            #invoice-print-area .invoice-print-company { font-size: 18px; font-weight: 700; }
+            #invoice-print-area .invoice-print-number { margin-top: 6px; font-family: monospace; overflow-wrap: anywhere; }
+            #invoice-print-area .invoice-print-meta {
+              display: grid;
+              grid-template-columns: 1fr 1fr;
+              gap: 18px;
+              margin: 24px 0;
+            }
+            #invoice-print-area .invoice-print-label { color: #555; font-size: 10px; text-transform: uppercase; letter-spacing: .06em; }
+            #invoice-print-area .invoice-print-value { margin-top: 4px; font-weight: 600; overflow-wrap: anywhere; }
+            #invoice-print-area table { width: 100%; border-collapse: collapse; margin-top: 12px; }
+            #invoice-print-area th, #invoice-print-area td { padding: 8px 6px; border-bottom: 1px solid #ccc; text-align: left; }
+            #invoice-print-area th:last-child, #invoice-print-area td:last-child { text-align: right; }
+            #invoice-print-area .invoice-print-totals { width: min(100%, 320px); margin: 16px 0 0 auto; }
+            #invoice-print-area .invoice-print-totals td { border: 0; }
+            #invoice-print-area .invoice-print-total { border-top: 2px solid #222 !important; font-size: 15px; font-weight: 700; }
+            #invoice-print-area .invoice-print-section { margin-top: 28px; break-inside: avoid; }
+            #invoice-print-area .invoice-print-footer { margin-top: 36px; padding-top: 12px; border-top: 1px solid #ccc; color: #555; }
+          }
+        `}</style>
+        {selectedInvoice && (
+          <article>
+            <header className="invoice-print-header">
+              <div>
+                <p className="invoice-print-company">{company_name || "Store"}</p>
+                <p>Invoice</p>
+              </div>
+              <div>
+                <h1 className="invoice-print-title">INVOICE</h1>
+                <p className="invoice-print-number">{selectedInvoice.invoice_number}</p>
+              </div>
+            </header>
+
+            <section className="invoice-print-meta">
+              <div>
+                <p className="invoice-print-label">Bill to</p>
+                <p className="invoice-print-value">
+                  {selectedInvoice.customers?.name || "Walk-in customer"}
+                </p>
+                {selectedInvoice.customers?.phone && (
+                  <p>{selectedInvoice.customers.phone}</p>
+                )}
+              </div>
+              <div>
+                <p className="invoice-print-label">Invoice details</p>
+                <p className="invoice-print-value">
+                  Issued: {format(new Date(selectedInvoice.issued_at || selectedInvoice.created_at), "dd/MM/yyyy")}
+                </p>
+                {selectedInvoice.due_date && (
+                  <p>Due: {format(new Date(selectedInvoice.due_date), "dd/MM/yyyy")}</p>
+                )}
+                <p>Status: {selectedInvoice.status.replace("_", " ")}</p>
+              </div>
+            </section>
+
+            <section className="invoice-print-section">
+              <h2>Invoice summary</h2>
+              <table>
+                <thead>
+                  <tr><th>Description</th><th>Amount</th></tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td>Subtotal</td>
+                    <td>{formatKesCents(parseKesToCents(String(selectedInvoice.subtotal)))}</td>
+                  </tr>
+                  <tr>
+                    <td>Discount</td>
+                    <td>{formatKesCents(parseKesToCents(String(selectedInvoice.discount_amount)))}</td>
+                  </tr>
+                  <tr>
+                    <td>Tax</td>
+                    <td>{formatKesCents(parseKesToCents(String(selectedInvoice.tax_amount)))}</td>
+                  </tr>
+                </tbody>
+              </table>
+              <table className="invoice-print-totals">
+                <tbody>
+                  <tr className="invoice-print-total">
+                    <td>Total</td>
+                    <td>{formatKesCents(parseKesToCents(String(selectedInvoice.total_amount)))}</td>
+                  </tr>
+                  <tr>
+                    <td>Paid</td>
+                    <td>{formatKesCents(parseKesToCents(String(selectedInvoice.paid_amount)))}</td>
+                  </tr>
+                  <tr>
+                    <td>Balance due</td>
+                    <td>{formatKesCents(parseKesToCents(String(selectedInvoice.balance_due)))}</td>
+                  </tr>
+                </tbody>
+              </table>
+            </section>
+
+            <section className="invoice-print-section">
+              <h2>Payment history</h2>
+              {payments.length > 0 ? (
+                <table>
+                  <thead>
+                    <tr><th>Date</th><th>Method</th><th>Reference</th><th>Amount</th></tr>
+                  </thead>
+                  <tbody>
+                    {payments.map((payment) => (
+                      <tr key={payment.id}>
+                        <td>{format(new Date(payment.created_at), "dd/MM/yyyy HH:mm")}</td>
+                        <td>{payment.payment_method.replace("_", " ")}</td>
+                        <td>{payment.reference_number || "-"}</td>
+                        <td>{formatKesCents(parseKesToCents(String(payment.amount)))}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              ) : (
+                <p>No payments recorded.</p>
+              )}
+            </section>
+
+            <footer className="invoice-print-footer">
+              Thank you for your business.
+            </footer>
+          </article>
+        )}
+      </section>
     </div>
+    </>
   );
 }

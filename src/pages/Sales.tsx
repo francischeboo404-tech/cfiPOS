@@ -25,9 +25,9 @@ import { Receipt } from "@/components/Receipt";
 import { Badge } from "@/components/ui/badge";
 import { HybridPaymentPanel } from "@/components/HybridPaymentPanel";
 import { useHybridPayment } from "@/hooks/useHybridPayment";
-import { useLoyaltyPoints } from "@/hooks/useLoyaltyPoints";
 import { ApiService } from "@/lib/api";
-import { LoyaltyRedemption } from "@/components/LoyaltyRedemption";
+import { isTestEtimsReceipt } from "@/lib/etimsReceipt";
+import { centsToKesString, formatKesCents, parseKesToCents } from "@/lib/exactMoney";
 import { useAuth } from "@/hooks/useAuthContext";
 import { useWebSockets } from "@/hooks/useWebSockets";
 import { useCallback, useState, useEffect, useRef } from "react";
@@ -67,6 +67,7 @@ import {
 interface Warehouse {
   id: string;
   name: string;
+  unit_of_measure?: string;
   is_main: boolean;
 }
 
@@ -75,16 +76,26 @@ interface Product {
   sku: string;
   barcode: string | null;
   name: string;
-  retail_price: number;
+  retail_price: number | string;
   tax_rate: number;
   tax_class?: { rate: number | string } | null;
   stock_on_hand: number;
+  unit_of_measure: string;
   category?: string;
+}
+
+interface ActivePromotionOffer {
+  promotion_id: string;
+  promotion_name: string;
+  product_id: string;
+  product_name: string;
+  discount_type: "percent" | "fixed_discount" | "fixed_price";
+  discount_value: string;
+  min_qty: number;
 }
 
 interface CartItem extends Product {
   quantity: number;
-  lineTotal: number;
 }
 
 interface Customer {
@@ -92,6 +103,22 @@ interface Customer {
   name: string;
   phone: string;
   store_credit_balance: number;
+  voucher?: {
+    number: string;
+    issueDate: string;
+    expiryDate: string;
+    balance: string;
+  } | null;
+}
+
+interface VoucherLookup {
+  id: string;
+  number: string;
+  expiryDate: string;
+  balance: string;
+  expired: boolean;
+  canEarnOrRedeem: boolean;
+  customer: { id: string; name: string; phone: string };
 }
 
 interface MpesaPaymentConfig {
@@ -103,9 +130,9 @@ interface MpesaPaymentConfig {
 
 interface ParkedSaleItem {
   quantity: number;
-  unit_price: number;
+  unit_price: number | string;
   tax_rate: number;
-  line_total: number;
+  line_total: number | string;
   product: Product;
 }
 
@@ -114,14 +141,13 @@ interface ParkedSale {
   created_at: string;
   customer: Customer | null;
   warehouse: Warehouse | null;
-  loyalty_discount: number;
+  loyalty_discount: number | string;
   items: ParkedSaleItem[];
 }
 
 export default function Sales() {
   const { user, isOfflineSession } = useAuth();
   const offline = useOfflineQueue();
-  const { awardLoyaltyPoints, redeemLoyaltyPoints } = useLoyaltyPoints();
 
   // Generate unique invoice number
   const generateInvoiceNumber = async () => {
@@ -129,6 +155,7 @@ export default function Sales() {
     return `INV-${Date.now()}`;
   };
   const [products, setProducts] = useState<Product[]>([]);
+  const [activePromotions, setActivePromotions] = useState<ActivePromotionOffer[]>([]);
   const [customers, setCustomers] = useState<Customer[]>([]);
   const [warehouses, setWarehouses] = useState<Warehouse[]>([]);
   const [mpesaConfig, setMpesaConfig] = useState<MpesaPaymentConfig>({
@@ -155,6 +182,9 @@ export default function Sales() {
   const [openingShift, setOpeningShift] = useState(false);
   const [completedSaleId, setCompletedSaleId] = useState<string | null>(null);
   const [provisionalReceipt, setProvisionalReceipt] = useState<OfflineSaleRecord | null>(null);
+  const currentProvisionalReceipt = provisionalReceipt
+    ? offline.sales.find((sale) => sale.id === provisionalReceipt.id) ?? provisionalReceipt
+    : null;
   const [parkedSales, setParkedSales] = useState<ParkedSale[]>([]);
   const [showParkedModal, setShowParkedModal] = useState(false);
   const barcodeInputRef = useRef<HTMLInputElement>(null);
@@ -197,10 +227,12 @@ export default function Sales() {
     }
   }, [showSalesHistoryModal, etimsFilter, fetchSalesHistory]);
 
-  const renderEtimsBadge = (status?: string | null) => {
+  const renderEtimsBadge = (status?: string | null, receiptNumber?: string | null) => {
     switch (status) {
       case "submitted":
-        return <Badge className="bg-green-600 hover:bg-green-700 text-white">Submitted</Badge>;
+        return isTestEtimsReceipt(receiptNumber)
+          ? <Badge variant="secondary">Test simulation</Badge>
+          : <Badge className="bg-amber-500 hover:bg-amber-600 text-white">Submitted · verify</Badge>;
       case "pending":
         return <Badge className="bg-amber-500 hover:bg-amber-600 text-white">Pending</Badge>;
       case "failed":
@@ -214,11 +246,8 @@ export default function Sales() {
   // Loyalty redemption state
   const [loyaltyDiscount, setLoyaltyDiscount] = useState(0);
   const [loyaltyPointsToRedeem, setLoyaltyPointsToRedeem] = useState(0);
-
-  const getSubtotalWithDiscount = () => {
-    const subtotal = cart.reduce((sum, item) => sum + item.lineTotal, 0);
-    return Math.max(0, subtotal - loyaltyDiscount);
-  };
+  const [voucherNumber, setVoucherNumber] = useState("");
+  const [voucher, setVoucher] = useState<VoucherLookup | null>(null);
 
   useWebSockets({
     onInventoryUpdated: (data) => {
@@ -239,11 +268,11 @@ export default function Sales() {
     },
   });
 
-  function getTotalAmount() {
-    return parseFloat(calculateTotals().total);
+  function getTotalAmountCents() {
+    return parseKesToCents(calculateTotals().total);
   }
 
-  const payment = useHybridPayment(getTotalAmount(), user?.id || "unknown");
+  const payment = useHybridPayment(getTotalAmountCents(), user?.id || "unknown");
   const {
     checkoutReserved,
     checkoutSessionId,
@@ -268,15 +297,20 @@ export default function Sales() {
       status: "reserved" | "completed" | "cancelled";
       warehouse_id: string | null;
       customer_id: string | null;
-      loyalty_discount: number;
+      loyalty_discount: number | string;
       items: Array<{
         product_id: string;
         quantity: number;
-        unit_price: number;
+        unit_price: number | string;
         tax_rate: number;
         sku: string;
         barcode: string | null;
         name: string;
+        unit_of_measure?: string;
+        price_segments?: Array<{
+          quantity: number;
+          discount_per_unit_cents: string;
+        }>;
       }>;
       mpesa_transactions: Array<{
         id: string;
@@ -304,11 +338,11 @@ export default function Sales() {
             sku: item.sku,
             barcode: item.barcode,
             name: item.name,
-            retail_price: Number(item.unit_price),
+            retail_price: item.unit_price,
+            unit_of_measure: item.unit_of_measure || currentProduct?.unit_of_measure || "piece",
             tax_rate: Number(item.tax_rate),
             stock_on_hand: currentProduct?.stock_on_hand ?? item.quantity,
             quantity: item.quantity,
-            lineTotal: Number(item.unit_price) * item.quantity,
           };
         }));
         setSelectedWarehouse(session.warehouse_id || "");
@@ -360,6 +394,10 @@ export default function Sales() {
     setSelectedCustomer(customerId);
     setLoyaltyDiscount(0);
     setLoyaltyPointsToRedeem(0);
+    const customer = customers.find((entry) => entry.id === customerId);
+    const number = customer?.voucher?.number || "";
+    setVoucherNumber(number);
+    setVoucher(null);
   };
 
   const handleLoyaltyDiscount = (discount: number, pointsUsed: number) => {
@@ -369,6 +407,27 @@ export default function Sales() {
     }
     setLoyaltyDiscount(discount);
     setLoyaltyPointsToRedeem(pointsUsed);
+  };
+
+  const lookupVoucher = async () => {
+    if (payment.checkoutReserved) return;
+    const number = voucherNumber.trim();
+    try {
+      const result = await ApiService.get<VoucherLookup>(
+        `/vouchers/lookup/${encodeURIComponent(number)}`,
+      );
+      setVoucher(result);
+      setSelectedCustomer(result.customer.id);
+      setLoyaltyPointsToRedeem(0);
+      if (result.expired) {
+        toast.warning("Voucher expired", {
+          description: "Its balance is available, but earning and redemption require renewal.",
+        });
+      }
+    } catch (error) {
+      setVoucher(null);
+      toast.error(error instanceof Error ? error.message : "Voucher lookup failed");
+    }
   };
 
   useEffect(() => {
@@ -427,7 +486,6 @@ export default function Sales() {
       const data = await ApiService.get<Product[]>(endpoint);
       const normalized = (data || []).map((product) => ({
         ...product,
-        retail_price: Number(product.retail_price),
         tax_rate: Number(product.tax_class?.rate ?? product.tax_rate ?? 0),
         stock_on_hand: Number(product.stock_on_hand),
       }));
@@ -442,7 +500,7 @@ export default function Sales() {
           if (cached) {
             setProducts(cached.products.map((product) => ({
               ...product,
-              retail_price: Number(product.retail_price),
+              unit_of_measure: product.unit_of_measure || "piece",
               tax_rate: Number(product.tax_class?.rate ?? product.tax_rate ?? 0),
               stock_on_hand: Number(product.stock_on_hand),
             })));
@@ -476,12 +534,22 @@ export default function Sales() {
     }
   }, []);
 
+  const loadActivePromotions = useCallback(async () => {
+    try {
+      const promotions = await ApiService.get<ActivePromotionOffer[]>("/promotions/active");
+      setActivePromotions(Array.isArray(promotions) ? promotions : []);
+    } catch (error) {
+      console.error("Could not load active promotion offers:", error);
+    }
+  }, []);
+
   useEffect(() => {
     void loadWarehouses();
     void loadCustomers();
     void loadMpesaConfig();
+    void loadActivePromotions();
     barcodeInputRef.current?.focus();
-  }, [loadCustomers, loadMpesaConfig, loadWarehouses]);
+  }, [loadActivePromotions, loadCustomers, loadMpesaConfig, loadWarehouses]);
 
   useEffect(() => {
     void loadProducts(selectedWarehouse);
@@ -543,18 +611,24 @@ export default function Sales() {
     }
     const cartProduct = {
       ...product,
-      retail_price: Number(product.retail_price),
       tax_rate: Number(product.tax_rate),
       stock_on_hand: Number(product.stock_on_hand),
     };
 
     if (
-      !Number.isFinite(cartProduct.retail_price) ||
       !Number.isFinite(cartProduct.tax_rate) ||
       !Number.isFinite(cartProduct.stock_on_hand)
     ) {
       toast.error(
         "Product information is invalid. Please refresh the product list.",
+      );
+      return;
+    }
+    try {
+      parseKesToCents(String(cartProduct.retail_price));
+    } catch {
+      toast.error(
+        "Product price is invalid. Please refresh the product list.",
       );
       return;
     }
@@ -572,8 +646,7 @@ export default function Sales() {
       }
       updateQuantity(product.id, existing.quantity + 1);
     } else {
-      const lineTotal = cartProduct.retail_price;
-      setCart([...cart, { ...cartProduct, quantity: 1, lineTotal }]);
+      setCart([...cart, { ...cartProduct, quantity: 1 }]);
     }
   };
 
@@ -585,7 +658,6 @@ export default function Sales() {
           ? {
               ...item,
               quantity: newQuantity,
-              lineTotal: item.retail_price * newQuantity,
             }
           : item,
       ),
@@ -598,21 +670,36 @@ export default function Sales() {
   };
 
   function calculateTotals() {
-    const subtotal = cart.reduce(
-      (sum, item) => sum + Number(item.lineTotal),
-      0,
+    const lineGrossCents = cart.map(
+      (item) => BigInt(parseKesToCents(String(item.retail_price))) * BigInt(item.quantity),
     );
-    const subtotalWithDiscount = Math.max(0, subtotal - loyaltyDiscount);
-    const taxAmount = cart.reduce(
-      (sum, item) =>
-        sum + (Number(item.lineTotal) * Number(item.tax_rate)) / 100,
-      0,
-    );
+    const grossCents = lineGrossCents.reduce((sum, amount) => sum + amount, 0n);
+    const discountCents = BigInt(parseKesToCents(String(loyaltyDiscount))) +
+      BigInt(parseKesToCents(String(loyaltyPointsToRedeem)));
+    const subtotalWithDiscount = grossCents > discountCents ? grossCents - discountCents : 0n;
+    let allocatedDiscount = 0n;
+    let taxCents = 0n;
+    lineGrossCents.forEach((lineCents, index) => {
+      const lineDiscount = index === lineGrossCents.length - 1
+        ? discountCents - allocatedDiscount
+        : grossCents === 0n
+          ? 0n
+          : discountCents * lineCents / grossCents;
+      allocatedDiscount += lineDiscount;
+      const discountedGross = lineCents - lineDiscount;
+      const rateMatch = /^(\d+)(?:\.(\d{1,2}))?$/.exec(String(cart[index].tax_rate).trim());
+      if (!rateMatch) throw new Error("Tax rate must have at most two decimal places");
+      const rateBasisPoints = BigInt(rateMatch[1]) * 100n +
+        BigInt((rateMatch[2] || "").padEnd(2, "0") || "0");
+      const divisor = 10_000n + rateBasisPoints;
+      const netCents = (discountedGross * 10_000n + divisor / 2n) / divisor;
+      taxCents += discountedGross - netCents;
+    });
     return {
-      subtotal: subtotal.toFixed(2),
-      subtotalWithDiscount: subtotalWithDiscount.toFixed(2),
-      taxAmount: taxAmount.toFixed(2),
-      total: (subtotalWithDiscount + taxAmount).toFixed(2),
+      subtotal: centsToKesString(grossCents),
+      subtotalWithDiscount: centsToKesString(subtotalWithDiscount),
+      taxAmount: centsToKesString(taxCents),
+      total: centsToKesString(subtotalWithDiscount),
     };
   }
 
@@ -628,8 +715,8 @@ export default function Sales() {
     if (
       selectedCustomer !== "walk-in" ||
       loyaltyDiscount > 0 ||
-      payment.mpesaAmount > 0 ||
-      payment.storeCreditAmount > 0 ||
+      payment.mpesaAmountCents > 0 ||
+      payment.storeCreditAmountCents > 0 ||
       payment.storeCreditBarcode ||
       payment.mpesaPending ||
       payment.checkoutReserved ||
@@ -639,9 +726,8 @@ export default function Sales() {
       return;
     }
 
-    const total = Number(calculateTotals().total);
-    if (!Number.isFinite(total) || total <= 0 ||
-        Math.round(payment.cashAmount * 100) < Math.round(total * 100)) {
+    const totalCents = parseKesToCents(calculateTotals().total);
+    if (totalCents <= 0 || payment.cashAmountCents < totalCents) {
       toast.error("Enter enough cash to cover the full sale before saving it offline.");
       return;
     }
@@ -652,22 +738,24 @@ export default function Sales() {
       id,
       userId: user.id,
       capturedAt,
-      expectedTotal: total,
+      expectedTotal: centsToKesString(totalCents),
       items: cart.map((item) => ({
         productId: item.id,
         name: item.name,
         sku: item.sku,
         quantity: item.quantity,
-        unitPrice: Number(item.retail_price),
+        unitPrice: centsToKesString(
+          parseKesToCents(String(item.retail_price)),
+        ),
       })),
       status: "pending",
       attempts: 0,
       payload: {
         items: cart.map((item) => ({ product_id: item.id, quantity: item.quantity })),
         payment_method: "cash",
-        cash_amount: Number(payment.cashAmount.toFixed(2)),
+        cash_amount: centsToKesString(payment.cashAmountCents),
         idempotency_key: `offline_${id}`,
-        expected_total_amount: Number(total.toFixed(2)),
+        expected_total_amount: centsToKesString(totalCents),
         offline_created_at: capturedAt,
         ...(selectedWarehouse ? { warehouse_id: selectedWarehouse } : {}),
       },
@@ -676,7 +764,7 @@ export default function Sales() {
     setLoading(true);
     try {
       await offline.enqueueSale(record);
-      if (payment.cashAmount > 0) {
+      if (payment.cashAmountCents > 0) {
         printerService.openCashDrawer().catch((error) => {
           console.error("Unable to open the cash drawer for offline sale:", error);
         });
@@ -738,11 +826,10 @@ export default function Sales() {
 
     const loadedCart: CartItem[] = parkedSale.items.map((item) => ({
       ...item.product,
-      retail_price: Number(item.unit_price),
+      retail_price: item.unit_price,
       tax_rate: Number(item.tax_rate),
       stock_on_hand: Number(item.product.stock_on_hand),
       quantity: Number(item.quantity),
-      lineTotal: Number(item.line_total),
     }));
     payment.reset();
     setCart(loadedCart);
@@ -801,38 +888,56 @@ export default function Sales() {
         tax_rate: item.tax_rate,
       }));
 
+      const pricingConfirmed = await payment.reserveCheckout({
+        items: items.map(({ product_id, quantity }) => ({ product_id, quantity })),
+        loyalty_discount: loyaltyDiscount,
+        cash_amount: centsToKesString(payment.cashAmountCents),
+        store_credit_amount: centsToKesString(payment.storeCreditAmountCents),
+        store_credit_barcode: payment.storeCreditBarcode || undefined,
+        warehouse_id: selectedWarehouse || undefined,
+        customer_id: selectedCustomer === "walk-in" ? undefined : selectedCustomer,
+        voucher_number: voucher?.number || undefined,
+        voucher_points_redeemed: loyaltyPointsToRedeem,
+      });
+      if (!pricingConfirmed) {
+        toast.info("Checkout pricing or store-credit allocation changed. Review the updated total and payment split before completing the sale.");
+        return;
+      }
+
       // Use server-side secure sale creation
       const saleResult = await ApiService.post<{ id?: string; sale?: { id?: string } }>("/sales", {
         customer_id: selectedCustomer === "walk-in" ? null : selectedCustomer,
         warehouse_id: selectedWarehouse,
         payment_method:
-          [payment.cashAmount, payment.mpesaAmount, payment.storeCreditAmount].filter(
+          [payment.cashAmountCents, payment.mpesaAmountCents, payment.storeCreditAmountCents].filter(
             (amount) => amount > 0,
           ).length > 1
             ? "hybrid"
-            : payment.cashAmount > 0
+            : payment.cashAmountCents > 0
               ? "cash"
-              : payment.mpesaAmount > 0
+              : payment.mpesaAmountCents > 0
                 ? "mpesa"
                 : "store_credit",
         items: items,
         loyalty_discount: loyaltyDiscount,
+        voucher_number: voucher?.number || undefined,
+        voucher_points_redeemed: loyaltyPointsToRedeem,
         idempotency_key: idempotencyKey,
-        cash_amount: payment.cashAmount,
-        mpesa_amount: payment.mpesaAmount,
+        cash_amount: centsToKesString(payment.cashAmountCents),
+        mpesa_amount: centsToKesString(payment.mpesaAmountCents),
         ...(payment.checkoutReserved
           ? { checkout_session_id: payment.checkoutSessionId }
           : {}),
-        ...(payment.mpesaAmount > 0
+        ...(payment.mpesaAmountCents > 0
           ? {
               mpesa_transaction_ids: payment.mpesaTransactionIds,
             }
           : {}),
-        store_credit_amount: payment.storeCreditAmount,
+        store_credit_amount: centsToKesString(payment.storeCreditAmountCents),
         store_credit_barcode: payment.storeCreditBarcode,
-        subtotal: parseFloat(currentTotals.subtotal),
-        tax_amount: parseFloat(currentTotals.taxAmount),
-        total_amount: parseFloat(currentTotals.total),
+        subtotal: currentTotals.subtotal,
+        tax_amount: currentTotals.taxAmount,
+        total_amount: currentTotals.total,
       });
 
       const saleId = saleResult.id || saleResult.sale?.id;
@@ -841,7 +946,7 @@ export default function Sales() {
       }
 
       // Kick Cash Drawer if cash is involved
-      if (payment.cashAmount > 0) {
+      if (payment.cashAmountCents > 0) {
         printerService.openCashDrawer().catch(console.error);
       }
 
@@ -856,6 +961,8 @@ export default function Sales() {
       setSelectedCustomer("walk-in");
       setLoyaltyDiscount(0);
       setLoyaltyPointsToRedeem(0);
+      setVoucherNumber("");
+      setVoucher(null);
       payment.reset();
       loadProducts(selectedWarehouse);
     } catch (error) {
@@ -867,19 +974,14 @@ export default function Sales() {
   };
 
   const openShift = async () => {
-    const amount = Number(openingFloat);
-    if (
-      !openingFloat.trim() ||
-      !Number.isFinite(amount) ||
-      amount < 0
-    ) {
+    if (!/^\d+(?:\.\d{1,2})?$/.test(openingFloat.trim())) {
       toast.error("Enter a valid non-negative opening cash float");
       return;
     }
 
     setOpeningShift(true);
     try {
-      await ApiService.post("/shifts/open", { opening_float: amount });
+      await ApiService.post("/shifts/open", { opening_float: openingFloat.trim() });
       setShowOpenShiftDialog(false);
       setOpeningFloat("");
       toast.success("Shift opened. Complete the sale when ready.");
@@ -918,8 +1020,10 @@ export default function Sales() {
               quantity: item.quantity,
             })),
             loyalty_discount: loyaltyDiscount,
-            cash_amount: payment.cashAmount,
-            store_credit_amount: payment.storeCreditAmount,
+            voucher_number: voucher?.number || undefined,
+            voucher_points_redeemed: loyaltyPointsToRedeem,
+            cash_amount: centsToKesString(payment.cashAmountCents),
+            store_credit_amount: centsToKesString(payment.storeCreditAmountCents),
             store_credit_barcode: payment.storeCreditBarcode || undefined,
             warehouse_id: selectedWarehouse || undefined,
             customer_id: selectedCustomer === "walk-in"
@@ -957,8 +1061,8 @@ export default function Sales() {
             quantity: item.quantity,
           })),
           loyalty_discount: loyaltyDiscount,
-          cash_amount: payment.cashAmount,
-          store_credit_amount: payment.storeCreditAmount,
+          cash_amount: centsToKesString(payment.cashAmountCents),
+          store_credit_amount: centsToKesString(payment.storeCreditAmountCents),
           store_credit_barcode: payment.storeCreditBarcode || undefined,
           warehouse_id: selectedWarehouse || undefined,
           customer_id: selectedCustomer === "walk-in"
@@ -1050,38 +1154,55 @@ export default function Sales() {
           </Card>
         )}
 
-        {offline.sales.some((sale) => sale.status !== "synced") && (
+        {offline.sales.length > 0 && (
           <Card className="border-primary/30">
             <CardHeader className="pb-2">
               <CardTitle className="text-base">
-                Offline sales awaiting confirmation ({offline.queueLength})
+                Offline sales &amp; reconciliation ({offline.queueLength} awaiting confirmation)
               </CardTitle>
             </CardHeader>
             <CardContent className="space-y-3">
-              {offline.sales
-                .filter((sale) => sale.status !== "synced")
-                .slice()
+              {[
+                ...offline.sales.filter((sale) => sale.status !== "synced"),
+                ...offline.sales.filter((sale) => sale.status === "synced").slice(-5),
+              ]
                 .reverse()
                 .map((sale) => (
                   <div key={sale.id} className="rounded-md border p-3">
                     <div className="flex flex-wrap items-center justify-between gap-2">
                       <div>
                         <p className="font-medium">
-                          OFF-{sale.id.slice(0, 8).toUpperCase()} · KSh {sale.expectedTotal.toLocaleString("en-KE", { minimumFractionDigits: 2 })}
+                          OFF-{sale.id.slice(0, 8).toUpperCase()} ·{" "}
+                          {formatKesCents(
+                            parseKesToCents(String(sale.expectedTotal)),
+                          )}
                         </p>
                         <p className="text-xs text-muted-foreground">
                           {new Date(sale.capturedAt).toLocaleString()} ·{" "}
-                          {sale.status === "conflict"
-                            ? "Needs review"
-                            : sale.status === "syncing"
-                              ? "Syncing"
-                              : "Waiting for server"}
+                          {sale.status === "synced"
+                            ? "Accepted by server; fiscal status unconfirmed"
+                            : sale.status === "conflict"
+                              ? "Needs review"
+                              : sale.status === "syncing"
+                                ? "Syncing"
+                                : "Waiting for server"}
                         </p>
                         {sale.lastError && (
                           <p className="mt-1 text-sm text-destructive">{sale.lastError}</p>
                         )}
                       </div>
                       <div className="flex gap-2">
+                        {sale.status === "synced" && sale.serverSaleId && (
+                          <Button
+                            size="sm"
+                            variant="outline"
+                            onClick={() => {
+                              if (sale.serverSaleId) setCompletedSaleId(sale.serverSaleId);
+                            }}
+                          >
+                            View server receipt &amp; fiscal status
+                          </Button>
+                        )}
                         {sale.status === "conflict" && (
                           <Button
                             size="sm"
@@ -1150,7 +1271,11 @@ export default function Sales() {
               </CardHeader>
               <CardContent>
                 <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-3 gap-3 max-h-[calc(100vh-400px)] overflow-y-auto pr-2">
-                  {filteredProducts.map((product) => (
+                  {filteredProducts.map((product) => {
+                    const offer = activePromotions.find(
+                      (candidate) => candidate.product_id === product.id,
+                    );
+                    return (
                     <div
                       key={product.id}
                       onClick={() => addToCart(product)}
@@ -1193,17 +1318,26 @@ export default function Sales() {
                         </div>
                         <div className="pt-2 border-t">
                           <p className="text-xl font-bold text-primary">
-                            KSh{" "}
-                            {Number(product.retail_price || 0).toLocaleString(
-                              "en-KE",
-                              { minimumFractionDigits: 2 },
+                            {formatKesCents(
+                              parseKesToCents(String(product.retail_price)),
                             )}
                           </p>
+                          {offer && (
+                            <p className="mt-1 text-xs font-medium text-green-700">
+                              {offer.promotion_name}: {offer.discount_type === "percent"
+                                ? `${offer.discount_value}% off`
+                                : offer.discount_type === "fixed_discount"
+                                  ? `KES ${offer.discount_value} off per ${product.unit_of_measure || "unit"}`
+                                  : `KES ${offer.discount_value} per ${product.unit_of_measure || "unit"}`}
+                              {offer.min_qty > 1 && ` from ${offer.min_qty} units`}
+                            </p>
+                          )}
                         </div>
                       </div>
                       <div className="absolute inset-0 border-2 border-transparent group-hover:border-primary rounded-xl pointer-events-none transition-all duration-300" />
                     </div>
-                  ))}
+                    );
+                  })}
                 </div>
               </CardContent>
             </Card>
@@ -1265,8 +1399,14 @@ export default function Sales() {
                                 {item.name}
                               </p>
                               <p className="text-xs text-muted-foreground">
-                                KSh {item.retail_price.toFixed(2)} each
+                                {formatKesCents(parseKesToCents(String(item.retail_price)))}
+                                {" "}each
                               </p>
+                              {activePromotions.find((offer) => offer.product_id === item.id) && (
+                                <p className="text-xs font-medium text-green-700">
+                                  Offer available from quantity {activePromotions.find((offer) => offer.product_id === item.id)?.min_qty}
+                                </p>
+                              )}
                             </div>
                             <Button
                               variant="ghost"
@@ -1316,7 +1456,10 @@ export default function Sales() {
                               </Button>
                             </div>
                             <p className="font-bold text-primary">
-                              KSh {item.lineTotal.toFixed(2)}
+                              {formatKesCents(
+                                BigInt(parseKesToCents(String(item.retail_price))) *
+                                  BigInt(item.quantity),
+                              )}
                             </p>
                           </div>
                         </div>
@@ -1349,33 +1492,78 @@ export default function Sales() {
                         </Select>
                       </div>
 
-                      {/* Loyalty Redemption - only show for registered customers */}
-                      {selectedCustomer !== "walk-in" && cart.length > 0 && (
-                        <LoyaltyRedemption
-                          customerId={selectedCustomer}
-                          totalAmount={cart.reduce(
-                            (sum, item) => sum + item.lineTotal,
-                            0,
-                          )}
-                          onApplyDiscount={handleLoyaltyDiscount}
-                          appliedDiscount={loyaltyDiscount}
-                          appliedPoints={loyaltyPointsToRedeem}
-                        />
-                      )}
+                      <div className="space-y-2">
+                        <Label htmlFor="voucher-number">CUSTOMER VOUCHER</Label>
+                        <div className="flex gap-2">
+                          <Input
+                            id="voucher-number"
+                            inputMode="numeric"
+                            maxLength={10}
+                            value={voucherNumber}
+                            onChange={(event) => {
+                              setVoucherNumber(event.target.value.replace(/\D/g, "").slice(0, 10));
+                              setVoucher(null);
+                              setLoyaltyPointsToRedeem(0);
+                            }}
+                            onKeyDown={(event) => {
+                              if (event.key === "Enter") {
+                                event.preventDefault();
+                                void lookupVoucher();
+                              }
+                            }}
+                            placeholder="Scan or enter 10-digit number"
+                            disabled={payment.checkoutReserved}
+                          />
+                          <Button
+                            type="button"
+                            variant="outline"
+                            onClick={() => void lookupVoucher()}
+                            disabled={payment.checkoutReserved || voucherNumber.length !== 10}
+                          >
+                            Find
+                          </Button>
+                        </div>
+                        {voucher && (
+                          <div className="rounded-md border p-2 text-sm">
+                            <div>{voucher.customer.name} · {voucher.customer.phone}</div>
+                            <div>Balance: {voucher.balance} points · Valid until {voucher.expiryDate}</div>
+                            {voucher.expired ? (
+                              <div className="text-destructive font-medium">Expired — renew before earning or redemption.</div>
+                            ) : (
+                              <div className="mt-2">
+                                <Label htmlFor="voucher-points">Redeem whole points (1 point = KES 1)</Label>
+                                <Input
+                                  id="voucher-points"
+                                  type="number"
+                                  min={0}
+                                  max={voucher.balance}
+                                  step={1}
+                                  value={loyaltyPointsToRedeem}
+                                  disabled={payment.checkoutReserved}
+                                  onChange={(event) => setLoyaltyPointsToRedeem(
+                                    Math.max(0, Math.floor(Number(event.target.value) || 0)),
+                                  )}
+                                />
+                              </div>
+                            )}
+                          </div>
+                        )}
+                      </div>
 
                       {/* Hybrid Payment Panel */}
                       <HybridPaymentPanel
-                        totalAmount={getTotalAmount()}
-                        cashAmount={payment.cashAmount}
-                        mpesaAmount={payment.mpesaAmount}
-                        storeCreditAmount={payment.storeCreditAmount}
-                        storeCreditAccountBalance={Number(
+                        totalAmountCents={payment.totalAmountCents}
+                        promotionSavingsCents={payment.promotionSavingsCents}
+                        cashAmountCents={payment.cashAmountCents}
+                        mpesaAmountCents={payment.mpesaAmountCents}
+                        storeCreditAmountCents={payment.storeCreditAmountCents}
+                        storeCreditAccountBalanceCents={parseKesToCents(String(
                           customers.find(
                             (customer) => customer.id === selectedCustomer,
                           )?.store_credit_balance || 0,
-                        )}
-                        remainingAmount={payment.remainingAmount}
-                        changeAmount={payment.changeAmount}
+                        ))}
+                        remainingAmountCents={payment.remainingAmountCents}
+                        changeAmountCents={payment.changeAmountCents}
                         status={payment.status}
                         mpesaPending={payment.mpesaPending}
                         checkoutReserved={payment.checkoutReserved}
@@ -1413,8 +1601,12 @@ export default function Sales() {
       )}
 
       <OfflineSaleReceipt
-        sale={provisionalReceipt}
+        sale={currentProvisionalReceipt}
         onClose={() => setProvisionalReceipt(null)}
+        onViewServerSale={(saleId) => {
+          setProvisionalReceipt(null);
+          setCompletedSaleId(saleId);
+        }}
       />
 
       <Dialog
@@ -1496,15 +1688,15 @@ export default function Sales() {
         </DialogContent>
       </Dialog>
 
-      {/* Sales History & eTIMS Fiscal Log Modal */}
+      {/* Sales History & eTIMS Submission Log Modal */}
       <Dialog open={showSalesHistoryModal} onOpenChange={setShowSalesHistoryModal}>
         <DialogContent className="max-w-4xl max-h-[85vh] flex flex-col">
           <DialogHeader>
             <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4 pr-6">
               <div>
-                <DialogTitle className="text-xl">Sales History & eTIMS Fiscal Log</DialogTitle>
+                <DialogTitle className="text-xl">Sales History & eTIMS Submission Log</DialogTitle>
                 <DialogDescription>
-                  Monitor sales transactions and KRA eTIMS fiscal submission statuses.
+                  Monitor recorded eTIMS workflow statuses. Submitted records require independent KRA verification.
                 </DialogDescription>
               </div>
               <div className="flex items-center gap-2">
@@ -1544,7 +1736,7 @@ export default function Sales() {
                     <TableHead>Cashier</TableHead>
                     <TableHead className="text-right">Total (KSh)</TableHead>
                     <TableHead>Payment</TableHead>
-                    <TableHead>eTIMS Status</TableHead>
+                    <TableHead>eTIMS Submission</TableHead>
                     <TableHead className="text-right">Action</TableHead>
                   </TableRow>
                 </TableHeader>
@@ -1560,10 +1752,12 @@ export default function Sales() {
                       <TableCell className="text-xs">{s.customer?.name || "Walk-in"}</TableCell>
                       <TableCell className="text-xs">{s.cashier?.profile?.full_name || s.cashier?.email || "—"}</TableCell>
                       <TableCell className="text-xs text-right font-medium">
-                        {Number(s.total_amount).toLocaleString("en-KE", { minimumFractionDigits: 2 })}
+                        {formatKesCents(
+                          parseKesToCents(String(s.total_amount)),
+                        )}
                       </TableCell>
                       <TableCell className="text-xs uppercase">{s.payment_method}</TableCell>
-                      <TableCell>{renderEtimsBadge(s.etims_status)}</TableCell>
+                      <TableCell>{renderEtimsBadge(s.etims_status, s.etims_receipt_no)}</TableCell>
                       <TableCell className="text-right">
                         <Button
                           variant="ghost"

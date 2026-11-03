@@ -15,6 +15,8 @@ import {
   Smartphone,
   Package,
   FileText,
+  Tag,
+  CreditCard,
 } from "lucide-react";
 import { NavLink } from "react-router-dom";
 import {
@@ -107,6 +109,12 @@ export function AppSidebar() {
           roles: ["admin", "manager"],
         },
         {
+          title: "Promotions",
+          url: "/promotions",
+          icon: Tag,
+          roles: ["admin", "manager"],
+        },
+        {
           title: "Inventory Operations",
           url: "/inventory-operations",
           icon: History,
@@ -163,6 +171,12 @@ export function AppSidebar() {
           url: "/settings",
           icon: Settings,
           roles: ["admin"],
+        },
+        {
+          title: "Installment Plans",
+          url: "/installment-plans",
+          icon: CreditCard,
+          roles: ["admin", "manager"],
         },
       ],
     },

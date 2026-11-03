@@ -125,8 +125,9 @@ checkout and callback registration.
   - The reconciliation worker queries `https://sandbox.safaricom.co.ke/mpesa/stkpushquery/v1/query`.
   - Daraja responds with `ResultCode: 0` ("The service request is processed successfully").
   - The transaction is updated to `status: 'completed'`.
-  - A fallback reconciliation receipt (`RECON_<checkoutRequestId>`) is assigned if not already present.
+  - No synthetic receipt number is created. The M-Pesa receipt remains blank until Safaricom's callback supplies it.
   - The cashier's till UI recovers on the next polling cycle, showing the payment as completed.
+  - If neither the callback nor a matching authoritative Daraja query confirms the outcome before the configured maximum age, the transaction is flagged `needs_review`, not marked failed. An administrator must verify the result in Safaricom and resolve it with evidence notes; marking it completed also requires the actual Safaricom receipt number.
 
 ---
 
@@ -143,7 +144,7 @@ checkout and callback registration.
     - `mpesa_receipt_number` is saved from the callback so the funds can be audited.
   - The sale is **NOT** credited or finalized automatically.
   - Navigating to `GET /api/admin/mpesa/unresolved` lists the transaction under the supervisor review queue.
-  - The administrator can review the discrepancy and resolve it via `POST /api/admin/mpesa/:id/resolve` with `{ "action": "mark_completed" }` or `{ "action": "mark_failed" }`.
+  - The administrator can review the discrepancy and resolve it via `POST /api/admin/mpesa/:id/resolve`. Resolution requires source notes; `mark_completed` also requires the verified Safaricom `receipt_number`, for example `{ "action": "mark_completed", "receipt_number": "NLJ7RT61SV", "notes": "Verified in Daraja portal, statement ref ..." }`. A receipt already recorded on another transaction is rejected.
 
 ---
 

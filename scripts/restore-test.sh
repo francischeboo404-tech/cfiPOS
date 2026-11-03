@@ -9,8 +9,7 @@
 #   ./scripts/restore-test.sh <path-to-backup-file>
 #
 # Environment variables:
-#   DATABASE_URL                  - Base PostgreSQL connection URL
-#   RESTORE_TEST_DATABASE_URL     - Optional dedicated test host URL
+#   RESTORE_TEST_DATABASE_URL     - Required admin URL for a dedicated, non-production restore-test server
 # ==============================================================================
 
 set -euo pipefail
@@ -54,13 +53,24 @@ if ! command -v "$PSQL_BIN" >/dev/null 2>&1; then
     done
 fi
 
-TARGET_URL="${RESTORE_TEST_DATABASE_URL:-${DATABASE_URL:-}}"
-if [ -z "$TARGET_URL" ] && [ -z "${PGDATABASE:-}" ]; then
-    echo "ERROR: DATABASE_URL must be configured to run restore verification." >&2
+if [ -z "${RESTORE_TEST_DATABASE_URL:-}" ]; then
+    echo "ERROR: RESTORE_TEST_DATABASE_URL must point to a dedicated, non-production PostgreSQL server." >&2
     exit 1
 fi
 
+if ! command -v "$PG_RESTORE_BIN" >/dev/null 2>&1 && [ ! -f "$PG_RESTORE_BIN" ]; then
+    echo "ERROR: pg_restore utility not found on PATH or in standard locations." >&2
+    exit 1
+fi
+
+if ! command -v "$PSQL_BIN" >/dev/null 2>&1 && [ ! -f "$PSQL_BIN" ]; then
+    echo "ERROR: psql utility not found on PATH or in standard locations." >&2
+    exit 1
+fi
+
+TARGET_URL="$RESTORE_TEST_DATABASE_URL"
 SCRATCH_DB="cfi_pos_restore_test_$(date +%s)_$$"
+SCRATCH_CREATED=0
 
 echo "=================================================================="
 echo "Starting Restore Verification Test"
@@ -71,17 +81,18 @@ echo "=================================================================="
 # Function to run SQL on administrative database
 run_admin_sql() {
     local sql="$1"
-    if [ -n "$TARGET_URL" ]; then
-        "$PSQL_BIN" "$TARGET_URL" -v ON_ERROR_STOP=1 -c "$sql"
-    else
-        "$PSQL_BIN" -v ON_ERROR_STOP=1 -c "$sql"
-    fi
+    "$PSQL_BIN" "$TARGET_URL" -v ON_ERROR_STOP=1 -c "$sql"
 }
 
 cleanup() {
     local exit_code=$?
+    trap - EXIT
     echo "Cleaning up scratch database: ${SCRATCH_DB}..."
-    run_admin_sql "DROP DATABASE IF EXISTS \"${SCRATCH_DB}\" WITH (FORCE);" || true
+    if [ "$SCRATCH_CREATED" -eq 1 ] &&
+        ! run_admin_sql "DROP DATABASE \"${SCRATCH_DB}\" WITH (FORCE);"; then
+        echo "ERROR: Failed to drop scratch database ${SCRATCH_DB}." >&2
+        exit_code=1
+    fi
     if [ $exit_code -eq 0 ]; then
         echo "=================================================================="
         echo "[SUCCESS] Backup verification PASSED cleanly."
@@ -91,71 +102,67 @@ cleanup() {
         echo "[FAILURE] Backup verification FAILED."
         echo "=================================================================="
     fi
+    exit "$exit_code"
 }
 trap cleanup EXIT
+
+# Validate the archive before provisioning the scratch database.
+"$PG_RESTORE_BIN" --list "$BACKUP_FILE" >/dev/null
+
+# Build a scratch connection URL while preserving query parameters.
+SCRATCH_URL="$(printf '%s\n' "$TARGET_URL" | sed -E "s|/[^/?]+(\?.*)?$|/${SCRATCH_DB}\1|")"
+if [ "$SCRATCH_URL" = "$TARGET_URL" ]; then
+    echo "ERROR: RESTORE_TEST_DATABASE_URL must include a database name in its URL path." >&2
+    exit 1
+fi
 
 # 1. Create scratch database
 echo "Creating isolated scratch database: ${SCRATCH_DB}..."
 run_admin_sql "CREATE DATABASE \"${SCRATCH_DB}\";"
-
-# Build connection string for scratch database
-if [ -n "$TARGET_URL" ]; then
-    # Replace database name in URL
-    SCRATCH_URL="$(echo "$TARGET_URL" | sed -E "s|/[^/?]+(\?.*)?$|/${SCRATCH_DB}\1|")"
-    if [ "$SCRATCH_URL" = "$TARGET_URL" ]; then
-        SCRATCH_URL="${TARGET_URL}/${SCRATCH_DB}"
-    fi
-fi
+SCRATCH_CREATED=1
 
 # 2. Restore backup into scratch database
 echo "Restoring backup archive with ${PG_RESTORE_BIN}..."
-if [ -n "${SCRATCH_URL:-}" ]; then
-    "$PG_RESTORE_BIN" \
-        --no-owner \
-        --no-privileges \
-        --clean \
-        --if-exists \
-        --dbname="$SCRATCH_URL" \
-        "$BACKUP_FILE" || true
-else
-    "$PG_RESTORE_BIN" \
-        --no-owner \
-        --no-privileges \
-        --clean \
-        --if-exists \
-        --dbname="$SCRATCH_DB" \
-        "$BACKUP_FILE" || true
-fi
+"$PG_RESTORE_BIN" \
+    --no-owner \
+    --no-privileges \
+    --exit-on-error \
+    --single-transaction \
+    --dbname="$SCRATCH_URL" \
+    "$BACKUP_FILE"
 
 # 3. Execute Sanity Queries
 echo "Executing sanity assertions against restored database..."
 
 run_scratch_query() {
     local sql="$1"
-    if [ -n "${SCRATCH_URL:-}" ]; then
-        "$PSQL_BIN" "$SCRATCH_URL" -t -A -v ON_ERROR_STOP=1 -c "$sql"
-    else
-        "$PSQL_BIN" -d "$SCRATCH_DB" -t -A -v ON_ERROR_STOP=1 -c "$sql"
-    fi
+    "$PSQL_BIN" "$SCRATCH_URL" -t -A -v ON_ERROR_STOP=1 -c "$sql"
 }
 
-MIGRATION_COUNT=$(run_scratch_query "SELECT count(*) FROM migrations;" 2>/dev/null || echo "0")
+MIGRATION_COUNT=$(run_scratch_query "SELECT count(*) FROM migrations;")
 echo "  [Sanity] Applied migrations count: ${MIGRATION_COUNT}"
 if [ "$MIGRATION_COUNT" -le 0 ]; then
     echo "ERROR: Migrations table is missing or empty in restored database." >&2
     exit 1
 fi
 
-USER_COUNT=$(run_scratch_query "SELECT count(*) FROM users;" 2>/dev/null || echo "0")
+CORE_TABLE_COUNT=$(run_scratch_query "SELECT count(*) FROM (VALUES ('users'), ('products'), ('sales'), ('stock_movements')) AS expected(table_name) WHERE to_regclass('public.' || table_name) IS NOT NULL;")
+echo "  [Sanity] Required core tables present: ${CORE_TABLE_COUNT}/4"
+if [ "$CORE_TABLE_COUNT" -ne 4 ]; then
+    echo "ERROR: One or more required core tables are missing from the restored database." >&2
+    exit 1
+fi
+
+USER_COUNT=$(run_scratch_query "SELECT count(*) FROM users;")
 echo "  [Sanity] System users count: ${USER_COUNT}"
 
-PRODUCT_COUNT=$(run_scratch_query "SELECT count(*) FROM products;" 2>/dev/null || echo "0")
+PRODUCT_COUNT=$(run_scratch_query "SELECT count(*) FROM products;")
 echo "  [Sanity] Products count: ${PRODUCT_COUNT}"
 
-SALE_COUNT=$(run_scratch_query "SELECT count(*) FROM sales;" 2>/dev/null || echo "0")
+SALE_COUNT=$(run_scratch_query "SELECT count(*) FROM sales;")
 echo "  [Sanity] Sales ledger count: ${SALE_COUNT}"
 
-TABLE_COUNT=$(run_scratch_query "SELECT count(*) FROM information_schema.tables WHERE table_schema = 'public';" 2>/dev/null || echo "0")
+TABLE_COUNT=$(run_scratch_query "SELECT count(*) FROM information_schema.tables WHERE table_schema = 'public' AND table_type = 'BASE TABLE';")
 echo "  [Sanity] Public schema tables count: ${TABLE_COUNT}"
 
 if [ "$TABLE_COUNT" -lt 15 ]; then

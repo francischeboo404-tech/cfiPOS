@@ -9,20 +9,29 @@ export class Vendor {
     @Column()
     name: string;
 
-    @Column({ nullable: true })
-    contact_person: string;
+    @Column({ type: "varchar", nullable: true })
+    contact_person: string | null;
 
-    @Column({ nullable: true })
-    phone: string;
+    @Column({ type: "varchar", nullable: true })
+    phone: string | null;
 
-    @Column({ nullable: true })
-    email: string;
+    @Column({ type: "varchar", nullable: true })
+    email: string | null;
 
     @Column({ nullable: true, type: "text" })
-    address: string;
+    address: string | null;
 
-    @Column({ nullable: true })
-    payment_terms: string;
+    @Column({ type: "varchar", nullable: true })
+    payment_terms: string | null;
+
+    @Column({ type: "boolean", default: false })
+    needs_review: boolean;
+
+    @Column({ type: "timestamptz", nullable: true })
+    reviewed_at: Date | null;
+
+    @Column({ type: "uuid", nullable: true })
+    reviewed_by: string | null;
 
     @CreateDateColumn()
     created_at: Date;

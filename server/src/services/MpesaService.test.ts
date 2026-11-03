@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { MpesaService, StkQueryResult } from "./MpesaService";
+import { classifyStkQueryResult, MpesaService, StkQueryResult } from "./MpesaService";
 import { expireAbandonedCheckoutReservations } from "./CheckoutReservationService";
 import { MpesaTransaction } from "../entity/MpesaTransaction";
 import { PaymentCheckoutSession } from "../entity/PaymentCheckoutSession";
@@ -114,6 +114,43 @@ test("MpesaService.queryStkPushStatus handles user cancellation and timeout resu
         });
         assert.equal(cancelledResult.resultCode, 1032);
         assert.equal(cancelledResult.resultDesc, "Request cancelled by user");
+    } finally {
+        MpesaService.setCustomFetch(null);
+    }
+});
+
+test("STK query results are authoritative only when Daraja confirms the matching request", () => {
+    const confirmed: StkQueryResult = {
+        responseCode: "0",
+        checkoutRequestId: "checkout-1",
+        resultCode: 0,
+    };
+    assert.equal(classifyStkQueryResult(confirmed, "checkout-1"), "completed");
+    assert.equal(classifyStkQueryResult(confirmed, "checkout-2"), "pending");
+    assert.equal(classifyStkQueryResult({ ...confirmed, responseCode: "1" }, "checkout-1"), "pending");
+    assert.equal(classifyStkQueryResult({
+        responseCode: "0",
+        checkoutRequestId: "checkout-1",
+        resultCode: 1032,
+    }, "checkout-1"), "failed");
+    assert.equal(classifyStkQueryResult({
+        responseCode: "0",
+        resultCode: 1032,
+    }, "checkout-1"), "pending");
+});
+
+test("MpesaService.queryStkPushStatus rejects non-success HTTP responses", async () => {
+    MpesaService.setCustomFetch(async () => new Response("gateway unavailable", { status: 503 }));
+    try {
+        await assert.rejects(
+            () => MpesaService.queryStkPushStatus("ws_CO_TEST_QUERY_1", {
+                shortcode: "174379",
+                passkey: "mock_passkey",
+                apiBaseUrl: "https://sandbox.safaricom.co.ke",
+                accessToken: "mock_token",
+            }),
+            /M-Pesa STK query failed \(HTTP 503\)/,
+        );
     } finally {
         MpesaService.setCustomFetch(null);
     }

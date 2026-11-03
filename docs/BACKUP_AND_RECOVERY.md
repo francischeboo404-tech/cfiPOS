@@ -13,7 +13,7 @@ This guide details disaster recovery, automated backup creation, and recovery te
   - Automated restore test script: `scripts/restore-test.sh`
 - **Security:**
   - Scripts **never store or hardcode credentials**.
-  - All connection strings are provided via environment variables (`DATABASE_URL`, or `PGHOST`, `PGPORT`, `PGUSER`, `PGDATABASE`, `PGPASSWORD`).
+  - Backup connections use `DATABASE_URL`; restore tests require `RESTORE_TEST_DATABASE_URL` for a dedicated, non-production PostgreSQL server.
 
 ---
 
@@ -43,20 +43,23 @@ export BACKUP_DIR="./backups"
 To prevent "silent backup failures" where backups are generated but cannot be restored, run `scripts/restore-test.sh`:
 
 ```bash
-# Verify a backup archive against an isolated scratch database
+# Set RESTORE_TEST_ADMIN_URL from the secret manager for a dedicated non-production PostgreSQL server.
+# This URL must connect to a database on that server with permission to create databases.
+export RESTORE_TEST_DATABASE_URL="${RESTORE_TEST_ADMIN_URL}"
 ./scripts/restore-test.sh ./backups/cfi_pos_backup_20261013_140000.dump
 ```
 
 ### Verification Flow
 
-1. Connects to PostgreSQL using `DATABASE_URL`.
+1. Connects only to the dedicated server configured by `RESTORE_TEST_DATABASE_URL`; it will not fall back to the production `DATABASE_URL`.
 2. Provisions a temporary scratch database `cfi_pos_restore_test_<timestamp>_<pid>`.
-3. Restores the archive using `pg_restore --clean --if-exists`.
+3. Validates the archive with `pg_restore --list`, then restores with `--exit-on-error` in a single transaction.
 4. Executes sanity queries:
    - Verifies the `migrations` ledger exists and has recorded applied migrations.
    - Verifies `users`, `products`, `sales`, and `stock_movements` tables.
    - Asserts public schema table count >= 15.
-5. Automatically tears down and drops the scratch database on exit.
+5. Fails on restore/query errors and reports failure if scratch-database cleanup fails.
+6. Automatically drops the scratch database on exit when it was successfully created.
 
 ---
 
@@ -65,13 +68,14 @@ To prevent "silent backup failures" where backups are generated but cannot be re
 ### Strategy A: Docker Compose Deployment (Cron Container or Host Cron)
 
 On the Docker host, configure a root or deploy-user crontab (`crontab -e`):
+Set `RESTORE_TEST_ADMIN_URL` in the cron environment to a dedicated, non-production PostgreSQL admin connection.
 
 ```cron
 # Run daily database backup at 02:00 AM EAT
 0 2 * * * cd /opt/cfi-pos && DATABASE_URL="postgresql://postgres:secure_pass@localhost:5432/postgres" RETENTION_DAYS=14 BACKUP_DIR="/var/backups/cfi-pos" ./scripts/backup.sh >> /var/log/cfi_pos_backup.log 2>&1
 
 # Run weekly backup restore test on Sunday at 03:00 AM EAT
-0 3 * * 0 cd /opt/cfi-pos && DATABASE_URL="postgresql://postgres:secure_pass@localhost:5432/postgres" ./scripts/restore-test.sh "$(ls -t /var/backups/cfi-pos/*.dump | head -1)" >> /var/log/cfi_pos_restore_test.log 2>&1
+0 3 * * 0 cd /opt/cfi-pos && RESTORE_TEST_DATABASE_URL="${RESTORE_TEST_ADMIN_URL}" ./scripts/restore-test.sh "$(ls -t /var/backups/cfi-pos/*.dump | head -1)" >> /var/log/cfi_pos_restore_test.log 2>&1
 ```
 
 ### Strategy B: Managed PostgreSQL (Render / Supabase / AWS RDS)
@@ -100,8 +104,9 @@ In the event of database corruption or hardware loss:
    aws s3 cp s3://cfi-pos-disaster-recovery/cfi_pos_backup_YYYYMMDD_HHMMSS.dump ./latest.dump
    ```
 3. **Verify Archive:**
+   Configure `RESTORE_TEST_ADMIN_URL` from the secret manager for the dedicated restore-test server.
    ```bash
-   ./scripts/restore-test.sh ./latest.dump
+   RESTORE_TEST_DATABASE_URL="${RESTORE_TEST_ADMIN_URL}" ./scripts/restore-test.sh ./latest.dump
    ```
 4. **Restore to Target Production Database:**
    ```bash

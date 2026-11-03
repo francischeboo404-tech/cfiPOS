@@ -7,15 +7,16 @@ export interface CachedPosProduct {
   tax_rate?: number | string | null;
   tax_class?: { rate: number | string } | null;
   stock_on_hand: number | string;
+  unit_of_measure?: string;
   category?: string;
 }
 
 export interface OfflineSalePayload {
   items: Array<{ product_id: string; quantity: number }>;
   payment_method: "cash";
-  cash_amount: number;
+  cash_amount: number | string;
   idempotency_key: string;
-  expected_total_amount: number;
+  expected_total_amount: number | string;
   offline_created_at: string;
   warehouse_id?: string;
 }
@@ -27,8 +28,8 @@ export interface OfflineSaleRecord {
   userId: string;
   payload: OfflineSalePayload;
   capturedAt: string;
-  expectedTotal: number;
-  items: Array<{ productId: string; name: string; sku: string; quantity: number; unitPrice: number }>;
+  expectedTotal: number | string;
+  items: Array<{ productId: string; name: string; sku: string; quantity: number; unitPrice: number | string }>;
   status: OfflineSaleStatus;
   attempts: number;
   lastError?: string;

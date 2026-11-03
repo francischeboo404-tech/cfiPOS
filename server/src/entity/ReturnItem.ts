@@ -24,6 +24,15 @@ export class ReturnItem {
     @Column("int")
     quantity: number;
 
+    @Column("bigint", { nullable: true })
+    net_revenue_cents: string | null;
+
+    @Column("bigint", { nullable: true })
+    vat_cents: string | null;
+
+    @Column("bigint", { nullable: true })
+    cogs_total_cents: string | null;
+
     @Column({
         type: "enum",
         enum: ReturnItemCondition,

@@ -4,8 +4,9 @@
   "description": "",
   "main": "index.js",
   "scripts": {
-    "test": "node --require ts-node/register --test src/controllers/PaymentController.test.ts src/data-source.test.ts src/services/etims/EtimsService.test.ts src/middleware/auth.test.ts src/services/MpesaService.test.ts src/lib/observability.test.ts",
+    "test": "node --require ts-node/register --test src/controllers/PaymentController.test.ts src/controllers/ReportAnalytics.test.ts src/controllers/DashboardAnalytics.test.ts src/data-source.test.ts src/services/etims/EtimsService.test.ts src/services/etims/EtimsItemMapping.test.ts src/services/etims/EtimsVscuClient.test.ts src/services/etims/EtimsSalesPayload.test.ts src/middleware/auth.test.ts src/services/MpesaService.test.ts src/lib/observability.test.ts src/lib/costingReportRules.test.ts src/lib/stockCosting.test.ts src/lib/supplierFifoAttribution.test.ts src/lib/supplierProfitability.test.ts src/lib/processingFeeAccounting.test.ts src/lib/promotionRules.test.ts src/lib/manualSupplierInvoiceAccounting.test.ts src/lib/supplierInvoiceTax.test.ts src/lib/installmentRules.test.ts src/lib/installmentPaymentRules.test.ts",
     "test:integration": "node scripts/run-integration.cjs",
+    "test:etims-integration": "node scripts/run-etims-invoice-allocation-integration.cjs",
     "build": "tsc -p tsconfig.json",
     "start": "node dist/index.js",
     "db:bootstrap": "ts-node src/bootstrap.ts",
