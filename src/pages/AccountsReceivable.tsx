@@ -32,14 +32,16 @@ import {
   Mail,
 } from "lucide-react";
 import { format, differenceInDays, subDays } from "date-fns";
+import { formatKesCents, parseKesToCents } from "@/lib/exactMoney";
 
 interface Invoice {
   id: string;
   invoice_number: string;
   customer_id: string | null;
-  total_amount: number;
-  paid_amount: number;
-  balance_due: number;
+  total_amount: number | string;
+  paid_amount: number | string;
+  balance_due: number | string;
+  balance_due_cents: bigint;
   status: string;
   due_date: string | null;
   issued_at: string | null;
@@ -54,7 +56,7 @@ interface Invoice {
 interface AgingBucket {
   label: string;
   range: string;
-  amount: number;
+  amount: bigint;
   count: number;
   color: string;
 }
@@ -64,7 +66,7 @@ interface CustomerBalance {
   customer_name: string;
   phone: string;
   email: string | null;
-  total_outstanding: number;
+  total_outstanding: bigint;
   invoice_count: number;
   oldest_invoice_days: number;
 }
@@ -74,14 +76,15 @@ const AccountsReceivable = () => {
   const { user } = useAuth();
   const [invoices, setInvoices] = useState<Invoice[]>([]);
   const [loading, setLoading] = useState(true);
+  const [loadError, setLoadError] = useState<string | null>(null);
   const [agingBuckets, setAgingBuckets] = useState<AgingBucket[]>([]);
   const [customerBalances, setCustomerBalances] = useState<CustomerBalance[]>(
     [],
   );
   const [totals, setTotals] = useState({
-    totalReceivables: 0,
-    totalOverdue: 0,
-    totalCurrent: 0,
+    totalReceivables: 0n,
+    totalOverdue: 0n,
+    totalCurrent: 0n,
     overdueCount: 0,
   });
 
@@ -91,35 +94,35 @@ const AccountsReceivable = () => {
       {
         label: "Current",
         range: "Not Yet Due",
-        amount: 0,
+        amount: 0n,
         count: 0,
         color: "bg-green-500",
       },
       {
         label: "1-30 Days",
         range: "1-30 Days Overdue",
-        amount: 0,
+        amount: 0n,
         count: 0,
         color: "bg-yellow-500",
       },
       {
         label: "31-60 Days",
         range: "31-60 Days Overdue",
-        amount: 0,
+        amount: 0n,
         count: 0,
         color: "bg-orange-500",
       },
       {
         label: "61-90 Days",
         range: "61-90 Days Overdue",
-        amount: 0,
+        amount: 0n,
         count: 0,
         color: "bg-red-400",
       },
       {
         label: "90+ Days",
         range: "Over 90 Days Overdue",
-        amount: 0,
+        amount: 0n,
         count: 0,
         color: "bg-red-600",
       },
@@ -127,7 +130,7 @@ const AccountsReceivable = () => {
 
     invoiceData.forEach((invoice) => {
       if (!invoice.due_date) {
-        buckets[0].amount += invoice.balance_due;
+        buckets[0].amount += invoice.balance_due_cents;
         buckets[0].count++;
         return;
       }
@@ -136,19 +139,19 @@ const AccountsReceivable = () => {
       const daysOverdue = differenceInDays(today, dueDate);
 
       if (daysOverdue <= 0) {
-        buckets[0].amount += invoice.balance_due;
+        buckets[0].amount += invoice.balance_due_cents;
         buckets[0].count++;
       } else if (daysOverdue <= 30) {
-        buckets[1].amount += invoice.balance_due;
+        buckets[1].amount += invoice.balance_due_cents;
         buckets[1].count++;
       } else if (daysOverdue <= 60) {
-        buckets[2].amount += invoice.balance_due;
+        buckets[2].amount += invoice.balance_due_cents;
         buckets[2].count++;
       } else if (daysOverdue <= 90) {
-        buckets[3].amount += invoice.balance_due;
+        buckets[3].amount += invoice.balance_due_cents;
         buckets[3].count++;
       } else {
-        buckets[4].amount += invoice.balance_due;
+        buckets[4].amount += invoice.balance_due_cents;
         buckets[4].count++;
       }
     });
@@ -169,7 +172,7 @@ const AccountsReceivable = () => {
         : 0;
 
       if (existing) {
-        existing.total_outstanding += invoice.balance_due;
+        existing.total_outstanding += invoice.balance_due_cents;
         existing.invoice_count++;
         existing.oldest_invoice_days = Math.max(
           existing.oldest_invoice_days,
@@ -181,7 +184,7 @@ const AccountsReceivable = () => {
           customer_name: invoice.customer.name,
           phone: invoice.customer.phone,
           email: invoice.customer.email,
-          total_outstanding: invoice.balance_due,
+          total_outstanding: invoice.balance_due_cents,
           invoice_count: 1,
           oldest_invoice_days: invoiceDays,
         });
@@ -189,7 +192,12 @@ const AccountsReceivable = () => {
     });
 
     const balances = Array.from(customerMap.values()).sort(
-      (a, b) => b.total_outstanding - a.total_outstanding,
+      (a, b) =>
+        a.total_outstanding === b.total_outstanding
+          ? 0
+          : a.total_outstanding > b.total_outstanding
+            ? -1
+            : 1,
     );
 
     setCustomerBalances(balances);
@@ -197,24 +205,24 @@ const AccountsReceivable = () => {
 
   const calculateTotals = useCallback((invoiceData: Invoice[]) => {
     const today = new Date();
-    let totalReceivables = 0;
-    let totalOverdue = 0;
-    let totalCurrent = 0;
+    let totalReceivables = 0n;
+    let totalOverdue = 0n;
+    let totalCurrent = 0n;
     let overdueCount = 0;
 
     invoiceData.forEach((invoice) => {
-      totalReceivables += invoice.balance_due;
+      totalReceivables += invoice.balance_due_cents;
 
       if (invoice.due_date) {
         const dueDate = new Date(invoice.due_date);
         if (differenceInDays(today, dueDate) > 0) {
-          totalOverdue += invoice.balance_due;
+          totalOverdue += invoice.balance_due_cents;
           overdueCount++;
         } else {
-          totalCurrent += invoice.balance_due;
+          totalCurrent += invoice.balance_due_cents;
         }
       } else {
-        totalCurrent += invoice.balance_due;
+        totalCurrent += invoice.balance_due_cents;
       }
     });
 
@@ -223,6 +231,7 @@ const AccountsReceivable = () => {
 
   const loadReceivables = useCallback(async () => {
     setLoading(true);
+    setLoadError(null);
     try {
       const data = await ApiService.get<Invoice[]>("/invoices");
       const invoiceData = (data || [])
@@ -231,9 +240,9 @@ const AccountsReceivable = () => {
         )
         .map((invoice) => ({
           ...invoice,
-          total_amount: Number(invoice.total_amount || 0),
-          paid_amount: Number(invoice.paid_amount || 0),
-          balance_due: Number(invoice.balance_due || 0),
+          balance_due_cents: BigInt(
+            parseKesToCents(String(invoice.balance_due || 0)),
+          ),
           customer: invoice.customer || undefined,
         })) as Invoice[];
       setInvoices(invoiceData);
@@ -242,6 +251,9 @@ const AccountsReceivable = () => {
       calculateTotals(invoiceData);
     } catch (error) {
       console.error("Error loading receivables:", error);
+      setLoadError(
+        error instanceof Error ? error.message : "Failed to load receivables",
+      );
     } finally {
       setLoading(false);
     }
@@ -273,7 +285,10 @@ const AccountsReceivable = () => {
     return <Badge className="bg-green-500">Current</Badge>;
   };
 
-  const totalAgingAmount = agingBuckets.reduce((sum, b) => sum + b.amount, 0);
+  const totalAgingAmount = agingBuckets.reduce(
+    (sum, bucket) => sum + bucket.amount,
+    0n,
+  );
 
   if (loading) {
     return (
@@ -285,6 +300,30 @@ const AccountsReceivable = () => {
           ))}
         </div>
         <Skeleton className="h-64" />
+      </div>
+    );
+  }
+
+  if (loadError) {
+    return (
+      <div className="container mx-auto p-6">
+        <Card>
+          <CardHeader>
+            <CardTitle className="flex items-center gap-2 text-destructive">
+              <AlertTriangle className="h-5 w-5" />
+              Receivables unavailable
+            </CardTitle>
+            <CardDescription role="alert">
+              Receivables could not be loaded, so balances and aging totals are
+              not shown. {loadError}
+            </CardDescription>
+          </CardHeader>
+          <CardContent>
+            <Button onClick={() => void loadReceivables()}>
+              Retry loading receivables
+            </Button>
+          </CardContent>
+        </Card>
       </div>
     );
   }
@@ -315,7 +354,7 @@ const AccountsReceivable = () => {
           </CardHeader>
           <CardContent>
             <div className="text-2xl font-bold">
-              KES {totals.totalReceivables.toLocaleString()}
+              {formatKesCents(totals.totalReceivables)}
             </div>
             <p className="text-xs text-muted-foreground">
               {invoices.length} outstanding invoices
@@ -332,7 +371,7 @@ const AccountsReceivable = () => {
           </CardHeader>
           <CardContent>
             <div className="text-2xl font-bold text-green-600">
-              KES {totals.totalCurrent.toLocaleString()}
+              {formatKesCents(totals.totalCurrent)}
             </div>
             <p className="text-xs text-muted-foreground">
               Within payment terms
@@ -347,7 +386,7 @@ const AccountsReceivable = () => {
           </CardHeader>
           <CardContent>
             <div className="text-2xl font-bold text-red-600">
-              KES {totals.totalOverdue.toLocaleString()}
+              {formatKesCents(totals.totalOverdue)}
             </div>
             <p className="text-xs text-muted-foreground">
               {totals.overdueCount} overdue invoices
@@ -397,14 +436,14 @@ const AccountsReceivable = () => {
                       {bucket.count} invoices
                     </span>
                     <span className="font-semibold w-32 text-right">
-                      KES {bucket.amount.toLocaleString()}
+                      {formatKesCents(bucket.amount)}
                     </span>
                   </div>
                 </div>
                 <Progress
                   value={
-                    totalAgingAmount > 0
-                      ? (bucket.amount / totalAgingAmount) * 100
+                    totalAgingAmount > 0n
+                      ? Number(bucket.amount * 10_000n / totalAgingAmount) / 100
                       : 0
                   }
                   className="h-2"
@@ -451,7 +490,7 @@ const AccountsReceivable = () => {
                       </div>
                     </TableCell>
                     <TableCell className="text-right font-semibold">
-                      KES {customer.total_outstanding.toLocaleString()}
+                      {formatKesCents(customer.total_outstanding)}
                     </TableCell>
                     <TableCell>
                       <div className="flex justify-center gap-1">
@@ -534,7 +573,7 @@ const AccountsReceivable = () => {
                       </TableCell>
                       <TableCell>{getStatusBadge(invoice)}</TableCell>
                       <TableCell className="text-right font-semibold">
-                        KES {invoice.balance_due.toLocaleString()}
+                        {formatKesCents(invoice.balance_due_cents)}
                       </TableCell>
                     </TableRow>
                   ))}

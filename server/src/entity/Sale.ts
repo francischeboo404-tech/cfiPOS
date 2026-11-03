@@ -86,6 +86,21 @@ export class Sale {
     @Column("decimal", { precision: 10, scale: 2, default: 0 })
     loyalty_discount: number;
 
+    @Column({ type: "uuid", nullable: true })
+    voucher_id: string | null;
+
+    @Column("bigint", { default: 0 })
+    voucher_points_earned: string;
+
+    @Column("bigint", { default: 0 })
+    voucher_points_redeemed: string;
+
+    @Column("bigint", { nullable: true })
+    voucher_balance_after: string | null;
+
+    @Column({ type: "date", nullable: true })
+    voucher_expiry_date: string | null;
+
     @Column({ type: "varchar", nullable: true })
     idempotency_key: string | null;
 
@@ -97,6 +112,9 @@ export class Sale {
     pesapal_status: string; // 'pending', 'completed', 'failed'
 
     // ETIMS Compliance fields
+    @Column("bigint", { nullable: true })
+    etims_invoice_number: string | null;
+
     @Column({ type: "varchar", length: 32, default: "not_applicable" })
     etims_status: EtimsStatus;
 

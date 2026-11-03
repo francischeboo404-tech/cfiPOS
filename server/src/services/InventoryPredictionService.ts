@@ -1,6 +1,8 @@
+import { centsToKesString, divideRoundHalfUp, parseKesToCents } from "../lib/exactMoney";
+
 export interface DailySalesPoint {
     date: string;
-    total: number;
+    total: string | number;
     count: number;
 }
 
@@ -16,11 +18,11 @@ type InventoryAlertUrgency = "critical" | "high" | "medium";
 
 export interface InventoryPredictionResult {
     salesForecast: {
-        next7Days: number;
-        next30Days: number;
+        next7Days: string;
+        next30Days: string;
         trendDirection: "increasing" | "stable" | "decreasing";
         confidence: "high" | "medium" | "low";
-        baselineDailySales: number;
+        baselineDailySales: string;
         historyDays: number;
         historicalTransactions: number;
         activeSalesDays: number;
@@ -38,7 +40,11 @@ export interface InventoryPredictionResult {
     recommendations: string[];
 }
 
-const roundCurrency = (amount: number) => Math.round((amount + Number.EPSILON) * 100) / 100;
+const formatCurrencyCents = (amountCents: bigint) => {
+    const whole = amountCents / 100n;
+    const fraction = String(amountCents % 100n).padStart(2, "0");
+    return `KSh ${new Intl.NumberFormat("en-KE").format(whole)}.${fraction}`;
+};
 
 export function createInventoryPredictions(
     inventory: InventoryPredictionProduct[],
@@ -47,16 +53,24 @@ export function createInventoryPredictions(
     const days = [...dailySales].sort((left, right) => left.date.localeCompare(right.date));
     const recentDays = days.slice(-30);
     const previousDays = days.slice(-60, -30);
-    const recentRevenue = recentDays.reduce((sum, day) => sum + day.total, 0);
-    const previousRevenue = previousDays.reduce((sum, day) => sum + day.total, 0);
+    const recentRevenueCents = recentDays.reduce(
+        (sum, day) => sum + parseKesToCents(String(day.total)),
+        0n,
+    );
+    const previousRevenueCents = previousDays.reduce(
+        (sum, day) => sum + parseKesToCents(String(day.total)),
+        0n,
+    );
     const historicalTransactions = days.reduce((sum, day) => sum + day.count, 0);
     const activeSalesDays = days.filter((day) => day.count > 0).length;
-    const baselineDailySales = recentDays.length > 0 ? recentRevenue / recentDays.length : 0;
-    const trendDirection = previousRevenue === 0
-        ? (recentRevenue > 0 ? "increasing" : "stable")
-        : recentRevenue > previousRevenue * 1.1
+    const baselineDailySalesCents = recentDays.length > 0
+        ? divideRoundHalfUp(recentRevenueCents, BigInt(recentDays.length))
+        : 0n;
+    const trendDirection = previousRevenueCents === 0n
+        ? (recentRevenueCents > 0n ? "increasing" : "stable")
+        : recentRevenueCents * 10n > previousRevenueCents * 11n
             ? "increasing"
-            : recentRevenue < previousRevenue * 0.9
+            : recentRevenueCents * 10n < previousRevenueCents * 9n
                 ? "decreasing"
                 : "stable";
     const confidence = historicalTransactions >= 90 && activeSalesDays >= 45
@@ -106,11 +120,11 @@ export function createInventoryPredictions(
 
     const trendInsight = previousDays.length === 0 || recentDays.length === 0
         ? "There is not enough dated sales history to compare 30-day periods."
-        : previousRevenue === 0 && recentRevenue === 0
+        : previousRevenueCents === 0n && recentRevenueCents === 0n
             ? "No completed sales were recorded in either 30-day comparison period."
-            : previousRevenue === 0
-                ? `Recent 30-day sales were KSh ${roundCurrency(recentRevenue).toLocaleString("en-KE")}; the preceding 30-day period had no completed sales.`
-                : `Completed sales were KSh ${roundCurrency(recentRevenue).toLocaleString("en-KE")} in the recent 30 days versus KSh ${roundCurrency(previousRevenue).toLocaleString("en-KE")} in the preceding 30 days (${trendDirection}).`;
+            : previousRevenueCents === 0n
+                ? `Recent 30-day sales were ${formatCurrencyCents(recentRevenueCents)}; the preceding 30-day period had no completed sales.`
+                : `Completed sales were ${formatCurrencyCents(recentRevenueCents)} in the recent 30 days versus ${formatCurrencyCents(previousRevenueCents)} in the preceding 30 days (${trendDirection}).`;
 
     const recommendations = inventoryAlerts.length > 0
         ? inventoryAlerts.slice(0, 5).map((alert) =>
@@ -126,11 +140,15 @@ export function createInventoryPredictions(
 
     return {
         salesForecast: {
-            next7Days: roundCurrency(baselineDailySales * 7),
-            next30Days: roundCurrency(baselineDailySales * 30),
+            next7Days: centsToKesString(recentDays.length > 0
+                ? divideRoundHalfUp(recentRevenueCents * 7n, BigInt(recentDays.length))
+                : 0n),
+            next30Days: centsToKesString(recentDays.length > 0
+                ? divideRoundHalfUp(recentRevenueCents * 30n, BigInt(recentDays.length))
+                : 0n),
             trendDirection,
             confidence,
-            baselineDailySales: roundCurrency(baselineDailySales),
+            baselineDailySales: centsToKesString(baselineDailySalesCents),
             historyDays: days.length,
             historicalTransactions,
             activeSalesDays,

@@ -1,17 +1,19 @@
 import { useState, useEffect, useCallback } from "react";
 import { ApiService } from "@/lib/api";
+import { parseKesToCents } from "@/lib/exactMoney";
 import { toast } from "sonner";
 
 export type PaymentStatus = "pending" | "partially_paid" | "paid" | "failed";
 
 interface PaymentState {
-  totalAmount: number;
-  cashAmount: number;
-  mpesaAmount: number;
-  storeCreditAmount: number;
+  totalAmountCents: number;
+  promotionSavingsCents: number;
+  cashAmountCents: number;
+  mpesaAmountCents: number;
+  storeCreditAmountCents: number;
   storeCreditBarcode: string | null;
-  remainingAmount: number;
-  changeAmount: number;
+  remainingAmountCents: number;
+  changeAmountCents: number;
   status: PaymentStatus;
   mpesaPending: boolean;
   recoveringMpesaSession: boolean;
@@ -25,17 +27,19 @@ interface PaymentState {
 interface StkCheckoutDetails {
   items: Array<{ product_id: string; quantity: number }>;
   loyalty_discount: number;
-  cash_amount: number;
-  store_credit_amount: number;
+  cash_amount: string;
+  store_credit_amount: string;
   store_credit_barcode?: string;
   warehouse_id?: string;
   customer_id?: string;
+  voucher_number?: string;
+  voucher_points_redeemed?: number;
 }
 
 interface MpesaTransaction {
   id: string;
   status: string;
-  amount: number;
+  amount: string | number;
   result_desc?: string | null;
   mismatch_reason?: string | null;
   mpesa_receipt_number: string | null;
@@ -46,11 +50,17 @@ interface MpesaTransaction {
 interface CheckoutSessionResponse {
   id: string;
   status: "reserved" | "completed" | "cancelled";
-  total_amount: number;
-  cash_amount: number;
-  store_credit_amount: number;
+  total_amount: string | number;
+  cash_amount: string | number;
+  store_credit_amount: string | number;
   store_credit_barcode: string | null;
   mpesa_transactions: MpesaTransaction[];
+  items?: Array<{
+    price_segments?: Array<{
+      quantity: number;
+      discount_per_unit_cents: string;
+    }>;
+  }>;
 }
 
 const getStoredCheckoutId = (key: string) => {
@@ -64,7 +74,7 @@ const getStoredCheckoutId = (key: string) => {
   }
 };
 
-export function useHybridPayment(totalAmount: number, ownerId = "unknown") {
+export function useHybridPayment(totalAmountCents: number, ownerId = "unknown") {
   const sessionKey = `pos-checkout-session:${ownerId}`;
   const paymentKey = `pos-checkout-payment:${ownerId}`;
   const [checkoutSessionId, setCheckoutSessionId] = useState(() =>
@@ -76,22 +86,31 @@ export function useHybridPayment(totalAmount: number, ownerId = "unknown") {
     try {
       const stored = window.localStorage.getItem(paymentKey);
       if (stored) {
-        const parsed = JSON.parse(stored) as Partial<PaymentState>;
-        const cashAmount = Number(parsed.cashAmount) || 0;
-        const mpesaAmount = Number(parsed.mpesaAmount) || 0;
-        const storeCreditAmount = Number(parsed.storeCreditAmount) || 0;
-        const paid = cashAmount + mpesaAmount + storeCreditAmount;
+        const parsed = JSON.parse(stored) as Partial<PaymentState> & Record<string, unknown>;
+        const cashAmountCents = Number.isSafeInteger(parsed.cashAmountCents)
+          ? Number(parsed.cashAmountCents)
+          : parseKesToCents(String(Number(parsed.cashAmount) || 0));
+        const mpesaAmountCents = Number.isSafeInteger(parsed.mpesaAmountCents)
+          ? Number(parsed.mpesaAmountCents)
+          : parseKesToCents(String(Number(parsed.mpesaAmount) || 0));
+        const storeCreditAmountCents = Number.isSafeInteger(parsed.storeCreditAmountCents)
+          ? Number(parsed.storeCreditAmountCents)
+          : parseKesToCents(String(Number(parsed.storeCreditAmount) || 0));
+        const paidCents = cashAmountCents + mpesaAmountCents + storeCreditAmountCents;
         return {
-          totalAmount,
-          cashAmount,
-          mpesaAmount,
-          storeCreditAmount,
+          totalAmountCents,
+          promotionSavingsCents: Number.isSafeInteger(parsed.promotionSavingsCents)
+            ? Number(parsed.promotionSavingsCents)
+            : 0,
+          cashAmountCents,
+          mpesaAmountCents,
+          storeCreditAmountCents,
           storeCreditBarcode: typeof parsed.storeCreditBarcode === "string"
             ? parsed.storeCreditBarcode
             : null,
-          remainingAmount: Math.max(0, totalAmount - paid),
-          changeAmount: Math.max(0, paid - totalAmount),
-          status: paid >= totalAmount ? "paid" : paid > 0 ? "partially_paid" : "pending",
+          remainingAmountCents: Math.max(0, totalAmountCents - paidCents),
+          changeAmountCents: Math.max(0, paidCents - totalAmountCents),
+          status: paidCents >= totalAmountCents ? "paid" : paidCents > 0 ? "partially_paid" : "pending",
           mpesaPending: false,
           recoveringMpesaSession: false,
           checkoutReserved: Boolean(getStoredCheckoutId(sessionKey)),
@@ -109,13 +128,14 @@ export function useHybridPayment(totalAmount: number, ownerId = "unknown") {
       window.localStorage.removeItem(paymentKey);
     }
     return {
-      totalAmount,
-      cashAmount: 0,
-      mpesaAmount: 0,
-      storeCreditAmount: 0,
+      totalAmountCents,
+      promotionSavingsCents: 0,
+      cashAmountCents: 0,
+      mpesaAmountCents: 0,
+      storeCreditAmountCents: 0,
       storeCreditBarcode: null,
-      remainingAmount: totalAmount,
-      changeAmount: 0,
+      remainingAmountCents: totalAmountCents,
+      changeAmountCents: 0,
       status: "pending",
       mpesaPending: false,
       recoveringMpesaSession: false,
@@ -145,16 +165,16 @@ export function useHybridPayment(totalAmount: number, ownerId = "unknown") {
   useEffect(() => {
     setState((prev) => ({
       ...prev,
-      totalAmount,
-      remainingAmount: Math.max(
+      totalAmountCents,
+      remainingAmountCents: Math.max(
         0,
-        totalAmount -
-          prev.cashAmount -
-          prev.mpesaAmount -
-          prev.storeCreditAmount,
+        totalAmountCents -
+          prev.cashAmountCents -
+          prev.mpesaAmountCents -
+          prev.storeCreditAmountCents,
       ),
     }));
-  }, [totalAmount]);
+  }, [totalAmountCents]);
 
   const restoreCheckoutSession = useCallback((session: CheckoutSessionResponse) => {
     if (session.status !== "reserved") {
@@ -163,23 +183,36 @@ export function useHybridPayment(totalAmount: number, ownerId = "unknown") {
     setRecoveringCheckout(false);
     const completed = session.mpesa_transactions.filter((transaction) => transaction.status === "completed");
     const pending = session.mpesa_transactions.find((transaction) => transaction.status === "pending");
-    const mpesaAmount = completed.reduce((sum, transaction) => sum + Number(transaction.amount), 0);
+    const mpesaAmountCents = completed.reduce(
+      (sum, transaction) => sum + parseKesToCents(String(transaction.amount)),
+      0,
+    );
     setCheckoutSessionId(session.id);
     setCheckoutReserved(true);
     setState((prev) => {
-      const cashAmount = Number(session.cash_amount);
-      const storeCreditAmount = Number(session.store_credit_amount);
-      const paid = cashAmount + mpesaAmount + storeCreditAmount;
+      const totalAmountCents = parseKesToCents(String(session.total_amount));
+      const promotionSavingsCents = (session.items || []).reduce(
+        (total, item) => total + (item.price_segments || []).reduce(
+          (lineTotal, segment) =>
+            lineTotal + Number(BigInt(segment.discount_per_unit_cents) * BigInt(segment.quantity)),
+          0,
+        ),
+        0,
+      );
+      const cashAmountCents = parseKesToCents(String(session.cash_amount));
+      const storeCreditAmountCents = parseKesToCents(String(session.store_credit_amount));
+      const paidCents = cashAmountCents + mpesaAmountCents + storeCreditAmountCents;
       return {
         ...prev,
-        totalAmount: Number(session.total_amount),
-        cashAmount,
-        mpesaAmount,
-        storeCreditAmount,
+        totalAmountCents,
+        promotionSavingsCents,
+        cashAmountCents,
+        mpesaAmountCents,
+        storeCreditAmountCents,
         storeCreditBarcode: session.store_credit_barcode,
-        remainingAmount: Math.max(0, Number(session.total_amount) - paid),
-        changeAmount: Math.max(0, paid - Number(session.total_amount)),
-        status: paid >= Number(session.total_amount) ? "paid" : paid > 0 ? "partially_paid" : "pending",
+        remainingAmountCents: Math.max(0, totalAmountCents - paidCents),
+        changeAmountCents: Math.max(0, paidCents - totalAmountCents),
+        status: paidCents >= totalAmountCents ? "paid" : paidCents > 0 ? "partially_paid" : "pending",
         mpesaPending: Boolean(pending),
         recoveringMpesaSession: Boolean(pending && !pending.checkout_request_id),
         checkoutRequestId: pending?.checkout_request_id || null,
@@ -200,8 +233,14 @@ export function useHybridPayment(totalAmount: number, ownerId = "unknown") {
     setCheckoutReserved(false);
     setRecoveringCheckout(false);
     setCheckoutSessionId(crypto.randomUUID());
-    setState((prev) => ({ ...prev, checkoutReserved: false }));
-  }, [paymentKey, sessionKey]);
+    setState((prev) => ({
+      ...prev,
+      checkoutReserved: false,
+      totalAmountCents,
+      promotionSavingsCents: 0,
+      remainingAmountCents: totalAmountCents,
+    }));
+  }, [paymentKey, sessionKey, totalAmountCents]);
 
   // Subscribe to M-Pesa transaction updates
   useEffect(() => {
@@ -242,16 +281,16 @@ export function useHybridPayment(totalAmount: number, ownerId = "unknown") {
             if (prev.mpesaTransactionIds.includes(transaction.id)) {
               return prev;
             }
-            const newMpesaAmount =
-              prev.mpesaAmount + Number(transaction.amount);
-            const totalPaid =
-              prev.cashAmount + newMpesaAmount + prev.storeCreditAmount;
-            const isFullyPaid = totalPaid >= prev.totalAmount;
+            const newMpesaAmountCents =
+              prev.mpesaAmountCents + parseKesToCents(String(transaction.amount));
+            const totalPaidCents =
+              prev.cashAmountCents + newMpesaAmountCents + prev.storeCreditAmountCents;
+            const isFullyPaid = totalPaidCents >= prev.totalAmountCents;
             return {
               ...prev,
-              mpesaAmount: newMpesaAmount,
-              remainingAmount: Math.max(0, prev.totalAmount - totalPaid),
-              changeAmount: Math.max(0, totalPaid - prev.totalAmount),
+              mpesaAmountCents: newMpesaAmountCents,
+              remainingAmountCents: Math.max(0, prev.totalAmountCents - totalPaidCents),
+              changeAmountCents: Math.max(0, totalPaidCents - prev.totalAmountCents),
               status: isFullyPaid ? "paid" : "partially_paid",
               mpesaPending: false,
               recoveringMpesaSession: false,
@@ -305,47 +344,90 @@ export function useHybridPayment(totalAmount: number, ownerId = "unknown") {
     };
   }, [state.checkoutRequestId, state.recoveringMpesaSession, checkoutSessionId]);
 
-  const addCashPayment = useCallback((amount: number) => {
+  const addCashPayment = useCallback((amountCents: number) => {
     setState((prev) => {
-      const newCashAmount = prev.cashAmount + amount;
-      const totalPaid =
-        newCashAmount + prev.mpesaAmount + prev.storeCreditAmount;
-      const isFullyPaid = totalPaid >= prev.totalAmount;
-      const change = Math.max(0, totalPaid - prev.totalAmount);
+      const newCashAmountCents = prev.cashAmountCents + amountCents;
+      const totalPaidCents =
+        newCashAmountCents + prev.mpesaAmountCents + prev.storeCreditAmountCents;
+      const isFullyPaid = totalPaidCents >= prev.totalAmountCents;
+      const changeCents = Math.max(0, totalPaidCents - prev.totalAmountCents);
 
       return {
         ...prev,
-        cashAmount: newCashAmount,
-        remainingAmount: Math.max(0, prev.totalAmount - totalPaid),
-        changeAmount: change,
+        cashAmountCents: newCashAmountCents,
+        remainingAmountCents: Math.max(0, prev.totalAmountCents - totalPaidCents),
+        changeAmountCents: changeCents,
         status: isFullyPaid
           ? "paid"
-          : totalPaid > 0
+          : totalPaidCents > 0
             ? "partially_paid"
             : "pending",
       };
     });
   }, []);
 
-  const setCashAmount = useCallback((amount: number) => {
+  const setCashAmount = useCallback((amountCents: number) => {
     setState((prev) => {
-      const totalPaid = amount + prev.mpesaAmount + prev.storeCreditAmount;
-      const isFullyPaid = totalPaid >= prev.totalAmount;
-      const change = Math.max(0, totalPaid - prev.totalAmount);
+      const totalPaidCents = amountCents + prev.mpesaAmountCents + prev.storeCreditAmountCents;
+      const isFullyPaid = totalPaidCents >= prev.totalAmountCents;
+      const changeCents = Math.max(0, totalPaidCents - prev.totalAmountCents);
 
       return {
         ...prev,
-        cashAmount: amount,
-        remainingAmount: Math.max(0, prev.totalAmount - totalPaid),
-        changeAmount: change,
+        cashAmountCents: amountCents,
+        remainingAmountCents: Math.max(0, prev.totalAmountCents - totalPaidCents),
+        changeAmountCents: changeCents,
         status: isFullyPaid
           ? "paid"
-          : totalPaid > 0
+          : totalPaidCents > 0
             ? "partially_paid"
             : "pending",
       };
     });
   }, []);
+
+  const reserveCheckout = useCallback(async (details: StkCheckoutDetails) => {
+    window.localStorage.setItem(sessionKey, checkoutSessionId);
+    const reservedSession = await ApiService.post<CheckoutSessionResponse>("/sales/checkouts", {
+      checkout_session_id: checkoutSessionId,
+      ...details,
+    });
+    if (reservedSession.status !== "reserved") {
+      throw new Error("Checkout stock reservation was not created");
+    }
+    setCheckoutReserved(true);
+    const serverTotalCents = parseKesToCents(String(reservedSession.total_amount));
+    const serverStoreCreditCents = parseKesToCents(String(reservedSession.store_credit_amount));
+    const totalChanged = serverTotalCents !== state.totalAmountCents ||
+      serverStoreCreditCents !== state.storeCreditAmountCents;
+    setState((prev) => ({
+      ...prev,
+      totalAmountCents: serverTotalCents,
+      storeCreditAmountCents: serverStoreCreditCents,
+      promotionSavingsCents: (reservedSession.items || []).reduce(
+        (total, item) => total + (item.price_segments || []).reduce(
+          (lineTotal, segment) =>
+            lineTotal + Number(BigInt(segment.discount_per_unit_cents) * BigInt(segment.quantity)),
+          0,
+        ),
+        0,
+      ),
+      remainingAmountCents: Math.max(
+        0,
+        serverTotalCents - prev.cashAmountCents - prev.mpesaAmountCents - serverStoreCreditCents,
+      ),
+      changeAmountCents: Math.max(
+        0,
+        prev.cashAmountCents + prev.mpesaAmountCents + serverStoreCreditCents - serverTotalCents,
+      ),
+      status: prev.cashAmountCents + prev.mpesaAmountCents + serverStoreCreditCents >= serverTotalCents
+        ? "paid"
+        : prev.cashAmountCents + prev.mpesaAmountCents + serverStoreCreditCents > 0
+          ? "partially_paid"
+          : "pending",
+    }));
+    return !totalChanged;
+  }, [checkoutSessionId, sessionKey, state.storeCreditAmountCents, state.totalAmountCents]);
 
   const initiateSTKPush = useCallback(
     async (
@@ -359,16 +441,8 @@ export function useHybridPayment(totalAmount: number, ownerId = "unknown") {
       }
 
       try {
-        if (!checkoutReserved) {
-          window.localStorage.setItem(sessionKey, checkoutSessionId);
-          const reservedSession = await ApiService.post<CheckoutSessionResponse>("/sales/checkouts", {
-            checkout_session_id: checkoutSessionId,
-            ...details,
-          });
-          if (reservedSession.status !== "reserved") {
-            throw new Error("Checkout stock reservation was not created");
-          }
-          setCheckoutReserved(true);
+        if (!await reserveCheckout(details)) {
+          throw new Error("Checkout pricing or store-credit allocation changed. Review the updated total and payment split before requesting payment.");
         }
         setState((prev) => ({ ...prev, mpesaPending: true, paybillReference: null, paybillAmount: null }));
         const data = await ApiService.post<{
@@ -423,7 +497,7 @@ export function useHybridPayment(totalAmount: number, ownerId = "unknown") {
         return false;
       }
     },
-    [checkoutReserved, checkoutSessionId, sessionKey],
+    [checkoutReserved, checkoutSessionId, reserveCheckout, sessionKey],
   );
 
   const initiatePaybill = useCallback(
@@ -437,16 +511,8 @@ export function useHybridPayment(totalAmount: number, ownerId = "unknown") {
         return false;
       }
       try {
-        if (!checkoutReserved) {
-          window.localStorage.setItem(sessionKey, checkoutSessionId);
-          const reservedSession = await ApiService.post<CheckoutSessionResponse>("/sales/checkouts", {
-            checkout_session_id: checkoutSessionId,
-            ...details,
-          });
-          if (reservedSession.status !== "reserved") {
-            throw new Error("Checkout stock reservation was not created");
-          }
-          setCheckoutReserved(true);
+        if (!await reserveCheckout(details)) {
+          throw new Error("Checkout pricing or store-credit allocation changed. Review the updated total and payment split before creating payment details.");
         }
         const paymentDetails = await ApiService.post<{
           success: boolean;
@@ -489,7 +555,7 @@ export function useHybridPayment(totalAmount: number, ownerId = "unknown") {
         return false;
       }
     },
-    [checkoutReserved, checkoutSessionId, sessionKey],
+    [checkoutReserved, checkoutSessionId, reserveCheckout, sessionKey],
   );
 
   const cancelCheckout = useCallback(async () => {
@@ -503,12 +569,14 @@ export function useHybridPayment(totalAmount: number, ownerId = "unknown") {
       setCheckoutSessionId(crypto.randomUUID());
       setState((prev) => ({
         ...prev,
-        cashAmount: 0,
-        mpesaAmount: 0,
-        storeCreditAmount: 0,
+        totalAmountCents,
+        promotionSavingsCents: 0,
+        cashAmountCents: 0,
+        mpesaAmountCents: 0,
+        storeCreditAmountCents: 0,
         storeCreditBarcode: null,
-        remainingAmount: prev.totalAmount,
-        changeAmount: 0,
+        remainingAmountCents: totalAmountCents,
+        changeAmountCents: 0,
         status: "pending",
         mpesaPending: false,
         recoveringMpesaSession: false,
@@ -524,25 +592,25 @@ export function useHybridPayment(totalAmount: number, ownerId = "unknown") {
       });
       return false;
     }
-  }, [checkoutReserved, checkoutSessionId, paymentKey, sessionKey]);
+  }, [checkoutReserved, checkoutSessionId, paymentKey, sessionKey, totalAmountCents]);
 
   const addStoreCreditPayment = useCallback(
-    (amount: number, barcode: string | null = null) => {
+    (amountCents: number, barcode: string | null = null) => {
       setState((prev) => {
-        const newSca = prev.storeCreditAmount + amount;
-        const totalPaid = prev.cashAmount + prev.mpesaAmount + newSca;
-        const isFullyPaid = totalPaid >= prev.totalAmount;
-        const change = Math.max(0, totalPaid - prev.totalAmount);
+        const newScaCents = prev.storeCreditAmountCents + amountCents;
+        const totalPaidCents = prev.cashAmountCents + prev.mpesaAmountCents + newScaCents;
+        const isFullyPaid = totalPaidCents >= prev.totalAmountCents;
+        const changeCents = Math.max(0, totalPaidCents - prev.totalAmountCents);
 
         return {
           ...prev,
-          storeCreditAmount: newSca,
+          storeCreditAmountCents: newScaCents,
           storeCreditBarcode: barcode,
-          remainingAmount: Math.max(0, prev.totalAmount - totalPaid),
-          changeAmount: change,
+          remainingAmountCents: Math.max(0, prev.totalAmountCents - totalPaidCents),
+          changeAmountCents: changeCents,
           status: isFullyPaid
             ? "paid"
-            : totalPaid > 0
+            : totalPaidCents > 0
               ? "partially_paid"
               : "pending",
         };
@@ -557,13 +625,14 @@ export function useHybridPayment(totalAmount: number, ownerId = "unknown") {
     setCheckoutReserved(false);
     setRecoveringCheckout(false);
     setState({
-      totalAmount: 0,
-      cashAmount: 0,
-      mpesaAmount: 0,
-      storeCreditAmount: 0,
+      totalAmountCents: 0,
+      promotionSavingsCents: 0,
+      cashAmountCents: 0,
+      mpesaAmountCents: 0,
+      storeCreditAmountCents: 0,
       storeCreditBarcode: null,
-      remainingAmount: 0,
-      changeAmount: 0,
+      remainingAmountCents: 0,
+      changeAmountCents: 0,
       status: "pending",
       mpesaPending: false,
       recoveringMpesaSession: false,
@@ -585,6 +654,7 @@ export function useHybridPayment(totalAmount: number, ownerId = "unknown") {
     finishCheckoutRecovery,
     clearMissingCheckout,
     cancelCheckout,
+    reserveCheckout,
     addCashPayment,
     setCashAmount,
     initiateSTKPush,

@@ -1,5 +1,6 @@
 import { Button } from "@/components/ui/button";
 import { Download } from "lucide-react";
+import { formatKesCents, parseKesToCents } from "@/lib/exactMoney";
 
 interface GRNItem {
   product_name: string;
@@ -7,8 +8,8 @@ interface GRNItem {
   ordered_quantity: number;
   received_quantity: number;
   rejected_quantity: number;
-  unit_cost: number;
-  line_total: number;
+  unit_cost: number | string;
+  line_total: number | string;
   batch_number?: string;
   expiry_date?: string;
 }
@@ -18,7 +19,7 @@ interface GRNInvoiceData {
   po_number: string;
   vendor_name: string;
   delivery_date: string;
-  total_value: number;
+  total_value: number | string;
   total_items: number;
   items: GRNItem[];
   notes?: string;
@@ -55,8 +56,8 @@ export function GRNInvoiceDownload({
         <td style="padding: 10px; border-bottom: 1px solid #e5e7eb; text-align: center;">${item.ordered_quantity}</td>
         <td style="padding: 10px; border-bottom: 1px solid #e5e7eb; text-align: center; color: #16a34a; font-weight: 600;">${item.received_quantity}</td>
         <td style="padding: 10px; border-bottom: 1px solid #e5e7eb; text-align: center; color: ${item.rejected_quantity > 0 ? "#dc2626" : "#6b7280"};">${item.rejected_quantity || "-"}</td>
-        <td style="padding: 10px; border-bottom: 1px solid #e5e7eb; text-align: right;">KSh ${item.unit_cost.toLocaleString("en-KE", { minimumFractionDigits: 2 })}</td>
-        <td style="padding: 10px; border-bottom: 1px solid #e5e7eb; text-align: right; font-weight: 600;">KSh ${item.line_total.toLocaleString("en-KE", { minimumFractionDigits: 2 })}</td>
+        <td style="padding: 10px; border-bottom: 1px solid #e5e7eb; text-align: right;">${formatKesCents(parseKesToCents(String(item.unit_cost)))}</td>
+        <td style="padding: 10px; border-bottom: 1px solid #e5e7eb; text-align: right; font-weight: 600;">${formatKesCents(parseKesToCents(String(item.line_total)))}</td>
       </tr>
     `,
       )
@@ -277,7 +278,7 @@ export function GRNInvoiceDownload({
             </div>
             <div class="totals-row total">
               <span>Total Value:</span>
-              <span>KSh ${data.total_value.toLocaleString("en-KE", { minimumFractionDigits: 2 })}</span>
+              <span>${formatKesCents(parseKesToCents(String(data.total_value)))}</span>
             </div>
           </div>
         </div>

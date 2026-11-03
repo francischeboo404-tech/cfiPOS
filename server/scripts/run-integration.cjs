@@ -194,7 +194,25 @@ const run = async () => {
                         EXISTS (
                             SELECT 1 FROM information_schema.tables
                             WHERE table_schema = 'public' AND table_name = 'stock_movements'
-                        ) AS has_stock_movement_ledger
+                        ) AS has_stock_movement_ledger,
+                        EXISTS (
+                            SELECT 1 FROM information_schema.tables
+                            WHERE table_schema = 'public' AND table_name = 'purchases'
+                        ) AS has_purchases,
+                        EXISTS (
+                            SELECT 1 FROM information_schema.tables
+                            WHERE table_schema = 'public' AND table_name = 'voucher_ledger'
+                        ) AS has_voucher_ledger,
+                        EXISTS (
+                            SELECT 1 FROM information_schema.tables
+                            WHERE table_schema = 'public' AND table_name = 'inventory_period_closes'
+                        ) AS has_inventory_period_closes,
+                        to_regclass('public.customer_voucher_number_seq') IS NOT NULL AS has_voucher_sequence,
+                        EXISTS (
+                            SELECT 1 FROM pg_trigger
+                            WHERE tgname = 'TRG_inventory_period_close_immutable'
+                              AND NOT tgisinternal
+                        ) AS has_period_close_immutability_trigger
                 `);
                 const migrationsDir = path.resolve(__dirname, "../src/migration");
                 const expectedMigrationCount = readdirSync(migrationsDir).filter(
@@ -203,6 +221,11 @@ const run = async () => {
                 assert.equal(baseline.rows[0].migration_count, expectedMigrationCount);
                 assert.equal(baseline.rows[0].has_sales, true);
                 assert.equal(baseline.rows[0].has_stock_movement_ledger, true);
+                assert.equal(baseline.rows[0].has_purchases, true);
+                assert.equal(baseline.rows[0].has_voucher_ledger, true);
+                assert.equal(baseline.rows[0].has_inventory_period_closes, true);
+                assert.equal(baseline.rows[0].has_voucher_sequence, true);
+                assert.equal(baseline.rows[0].has_period_close_immutability_trigger, true);
             } finally {
                 await bootstrapClient.end();
             }
@@ -221,6 +244,47 @@ const run = async () => {
             if (bootstrapDatabaseCreated) {
                 await admin.query(`DROP DATABASE "${bootstrapDatabaseName}"`);
             }
+        }
+
+        await admin.query(`DROP DATABASE "${databaseName}"`);
+        databaseCreated = false;
+        await admin.query(`CREATE DATABASE "${databaseName}"`);
+        databaseCreated = true;
+        const integrationBootstrapEnvironment = {
+            ...process.env,
+            DATABASE_URL: testDatabaseUrl.toString(),
+            POS_DB_BOOTSTRAP_CONFIRM: "CREATE_SCHEMA_IN_EMPTY_DATABASE",
+            TYPEORM_SYNCHRONIZE: "false",
+            NODE_ENV: "test",
+        };
+        const integrationBootstrapResult = spawnSync(
+            process.execPath,
+            ["--require", "ts-node/register", "src/bootstrap.ts"],
+            { cwd: process.cwd(), encoding: "utf8", env: integrationBootstrapEnvironment },
+        );
+        if (integrationBootstrapResult.error) throw integrationBootstrapResult.error;
+        if (integrationBootstrapResult.status !== 0) {
+            throw new Error("Could not bootstrap the isolated API integration database.");
+        }
+        const apiDatabaseClient = new Client({
+            connectionString: testDatabaseUrl.toString(),
+            options: `-c app.encryption_key=${process.env.ENCRYPTION_KEY}`,
+        });
+        try {
+            await apiDatabaseClient.connect();
+            await apiDatabaseClient.query(`
+                ALTER TABLE public.customers
+                ADD COLUMN IF NOT EXISTS phone_encrypted TEXT;
+                ALTER TABLE public.mpesa_transactions
+                ADD COLUMN IF NOT EXISTS phone_encrypted TEXT;
+            `);
+            const encryptionMigrationPath = path.resolve(
+                __dirname,
+                "../test-fixtures/require_encryption_key_setting.sql",
+            );
+            await apiDatabaseClient.query(readFileSync(encryptionMigrationPath, "utf8"));
+        } finally {
+            await apiDatabaseClient.end().catch(() => {});
         }
 
         const testEnvironment = {

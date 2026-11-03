@@ -13,14 +13,31 @@ interface Shift {
   cashier_id: string;
   start_time: string;
   end_time: string | null;
-  opening_float: number;
-  expected_cash: number;
-  actual_cash: number;
-  mpesa_total: number;
-  total_sales: number;
+  opening_float: string;
+  expected_cash: string;
+  actual_cash: string;
+  mpesa_total: string;
+  total_sales: string;
   status: string;
   cashier?: { full_name: string };
 }
+
+const parseMoneyCents = (value: string): bigint => {
+  const match = /^(-?)(\d+)(?:\.(\d{1,2}))?$/.exec(value.trim());
+  if (!match) throw new Error('Invalid exact KES amount');
+  const cents = BigInt(match[2]) * 100n + BigInt((match[3] || '').padEnd(2, '0') || '0');
+  return match[1] === '-' ? -cents : cents;
+};
+
+const formatMoneyCents = (cents: bigint): string => {
+  const negative = cents < 0n;
+  const absolute = negative ? -cents : cents;
+  const whole = new Intl.NumberFormat('en-KE').format(absolute / 100n);
+  const fraction = String(absolute % 100n).padStart(2, '0');
+  return `${negative ? '-' : ''}KSh ${whole}.${fraction}`;
+};
+
+const formatMoney = (value: string): string => formatMoneyCents(parseMoneyCents(value));
 
 export default function Shifts() {
   const [shifts, setShifts] = useState<Shift[]>([]);
@@ -59,14 +76,14 @@ export default function Shifts() {
   };
 
   const startShift = async () => {
-    if (!openingCash || parseFloat(openingCash) < 0) {
+    if (!/^\d+(?:\.\d{1,2})?$/.test(openingCash.trim())) {
       toast.error('Please enter a valid opening cash float');
       return;
     }
 
     try {
       const data = await ApiService.post<Shift>('/shifts/open', {
-        opening_float: parseFloat(openingCash)
+        opening_float: openingCash.trim()
       });
       setActiveShift(data);
       setOpeningCash('');
@@ -80,7 +97,7 @@ export default function Shifts() {
   const endShift = async () => {
     if (!activeShift) return;
     
-    if (!closingCash || parseFloat(closingCash) < 0) {
+    if (!/^\d+(?:\.\d{1,2})?$/.test(closingCash.trim())) {
       toast.error('Please enter a valid closing cash amount');
       return;
     }
@@ -88,22 +105,22 @@ export default function Shifts() {
     try {
       // In the backend, the closing logic calculates expected_cash (opening_float + cash sales)
       // We send the actual_cash counted by the cashier
-      const enteredClosingCash = parseFloat(closingCash);
+      const enteredClosingCash = closingCash.trim();
 
       const res = await ApiService.post<{message: string, shift: Shift}>(`/shifts/${activeShift.id}/close`, {
         actual_cash: enteredClosingCash
       });
 
       const closedShift = res.shift;
-      const expectedClosingCash = closedShift.expected_cash;
-      const variance = enteredClosingCash - expectedClosingCash;
+      const expectedClosingCents = parseMoneyCents(closedShift.expected_cash);
+      const varianceCents = parseMoneyCents(enteredClosingCash) - expectedClosingCents;
 
-      if (Math.abs(variance) > 0) {
+      if (varianceCents !== 0n) {
         toast.warning(
-          `Shift Closed with Cash Variance. Expected: KSh ${expectedClosingCash.toLocaleString('en-KE')}, Entered: KSh ${enteredClosingCash.toLocaleString('en-KE')}. Variance: KSh ${variance.toLocaleString('en-KE')}`
+          `Shift Closed with Cash Variance. Expected: ${formatMoney(closedShift.expected_cash)}, Entered: ${formatMoney(enteredClosingCash)}. Variance: ${formatMoneyCents(varianceCents)}`
         );
       } else {
-        toast.success(`Shift ended perfectly! Total sales: KSh ${Number(closedShift.total_sales).toLocaleString('en-KE', { minimumFractionDigits: 2 })}`);
+        toast.success(`Shift ended perfectly! Total sales: ${formatMoney(closedShift.total_sales)}`);
       }
 
       setActiveShift(null);
@@ -157,7 +174,7 @@ export default function Shifts() {
                 <div className="p-4 bg-muted rounded-lg">
                   <p className="text-sm text-muted-foreground mb-1">Opening Float</p>
                   <p className="font-semibold">
-                    KSh {Number(activeShift.opening_float).toLocaleString('en-KE', { minimumFractionDigits: 2 })}
+                    {formatMoney(activeShift.opening_float)}
                   </p>
                 </div>
               </div>
@@ -242,8 +259,8 @@ export default function Shifts() {
                   </TableRow>
                 ) : (
                   shifts.map((shift) => {
-                    const expected = Number(shift.expected_cash || 0);
-                    const actual = Number(shift.actual_cash || 0);
+                    const expected = parseMoneyCents(shift.expected_cash || '0');
+                    const actual = parseMoneyCents(shift.actual_cash || '0');
                     const variance = shift.status === 'closed' ? actual - expected : null;
                     return (
                       <TableRow key={shift.id}>
@@ -260,19 +277,19 @@ export default function Shifts() {
                           {calculateShiftDuration(shift.start_time, shift.end_time)}
                         </TableCell>
                         <TableCell className="text-sm">
-                          KSh {Number(shift.opening_float).toLocaleString('en-KE', { minimumFractionDigits: 0 })}
+                          {formatMoney(shift.opening_float)}
                         </TableCell>
                         <TableCell className="text-sm text-muted-foreground">
-                          {shift.status === 'closed' ? `KSh ${expected.toLocaleString('en-KE', { minimumFractionDigits: 0 })}` : '-'}
+                          {shift.status === 'closed' ? formatMoneyCents(expected) : '-'}
                         </TableCell>
                         <TableCell className="text-sm font-medium">
-                          {shift.status === 'closed' ? `KSh ${actual.toLocaleString('en-KE', { minimumFractionDigits: 0 })}` : '-'}
+                          {shift.status === 'closed' ? formatMoneyCents(actual) : '-'}
                         </TableCell>
                         <TableCell className={`text-sm font-bold ${variance && variance < 0 ? 'text-destructive' : variance && variance > 0 ? 'text-green-600' : ''}`}>
-                          {variance !== null ? `${variance > 0 ? '+' : ''}KSh ${variance.toLocaleString('en-KE', { minimumFractionDigits: 0 })}` : '-'}
+                          {variance !== null ? `${variance > 0n ? '+' : ''}${formatMoneyCents(variance)}` : '-'}
                         </TableCell>
                         <TableCell className="hidden lg:table-cell font-medium">
-                          KSh {Number(shift.total_sales || 0).toLocaleString('en-KE', { minimumFractionDigits: 2 })}
+                          {formatMoney(shift.total_sales || '0')}
                         </TableCell>
                         <TableCell>
                           <Badge variant={shift.status === 'open' ? 'default' : 'secondary'}>

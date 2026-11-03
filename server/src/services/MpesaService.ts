@@ -2,6 +2,7 @@ import { AppDataSource } from "../data-source";
 import { MpesaTransaction } from "../entity/MpesaTransaction";
 import { Setting } from "../entity/Setting";
 import { Sale } from "../entity/Sale";
+import { centsToKesString, parseKesToCents } from "../lib/exactMoney";
 import { AccountingService } from "./AccountingService";
 
 export const MPESA_RECONCILE_LOCK_ID = 71943003;
@@ -19,7 +20,7 @@ export interface ReconcileStats {
     checked: number;
     reconciledCompleted: number;
     reconciledFailed: number;
-    reconciledTimedOut: number;
+    reconciledNeedsReview: number;
 }
 
 // Terminal error codes from Safaricom Daraja STK Push / Query
@@ -29,6 +30,18 @@ export interface ReconcileStats {
 // 2001: The initiator information is invalid / Wrong PIN
 // 1019: Transaction expired
 const TERMINAL_RESULT_CODES = new Set([1, 1019, 1032, 1037, 2001]);
+
+export const classifyStkQueryResult = (
+    result: StkQueryResult,
+    expectedCheckoutRequestId: string,
+): "completed" | "failed" | "pending" => {
+    if (result.responseCode !== "0" || result.checkoutRequestId !== expectedCheckoutRequestId) {
+        return "pending";
+    }
+    if (result.resultCode === 0) return "completed";
+    if (result.resultCode !== undefined && TERMINAL_RESULT_CODES.has(result.resultCode)) return "failed";
+    return "pending";
+};
 
 export class MpesaService {
     private static customFetch: typeof fetch | null = null;
@@ -81,11 +94,17 @@ export class MpesaService {
         if (!shortcode && AppDataSource.isInitialized) {
             try {
                 const settingRepo = AppDataSource.getRepository(Setting);
-                const [shortcodeSetting, legacyTillSetting] = await Promise.all([
+                const [shortcodeSetting, legacyTillSetting, paybillSetting, accountTypeSetting] = await Promise.all([
                     settingRepo.findOneBy({ key: "mpesa_shortcode" }),
                     settingRepo.findOneBy({ key: "mpesa_till_number" }),
+                    settingRepo.findOneBy({ key: "mpesa_paybill" }),
+                    settingRepo.findOneBy({ key: "mpesa_stk_account_type" }),
                 ]);
-                shortcode = shortcodeSetting?.value?.trim() || legacyTillSetting?.value?.trim() || "";
+                const accountType = accountTypeSetting?.value?.trim().toLowerCase();
+                // For paybill accounts the STK shortcode is stored under mpesa_paybill.
+                shortcode = accountType === "paybill"
+                    ? paybillSetting?.value?.trim() || shortcodeSetting?.value?.trim() || legacyTillSetting?.value?.trim() || ""
+                    : shortcodeSetting?.value?.trim() || legacyTillSetting?.value?.trim() || "";
             } catch {
                 shortcode = "";
             }
@@ -116,7 +135,14 @@ export class MpesaService {
             }),
         });
 
-        const data = await queryResponse.json() as Record<string, unknown>;
+        if (!queryResponse.ok) {
+            throw new Error(`M-Pesa STK query failed (HTTP ${queryResponse.status})`);
+        }
+        const responseBody: unknown = await queryResponse.json();
+        if (!responseBody || typeof responseBody !== "object" || Array.isArray(responseBody)) {
+            throw new Error("M-Pesa STK query returned an invalid response");
+        }
+        const data = responseBody as Record<string, unknown>;
         const responseCode = String(data.ResponseCode ?? "");
         const rawResultCode = data.ResultCode;
         const resultCode = rawResultCode !== undefined && rawResultCode !== null && Number.isInteger(Number(rawResultCode))
@@ -144,7 +170,7 @@ export class MpesaService {
             checked: 0,
             reconciledCompleted: 0,
             reconciledFailed: 0,
-            reconciledTimedOut: 0,
+            reconciledNeedsReview: 0,
         };
 
         const queryTimeoutMinutes = options?.queryTimeoutMinutes ??
@@ -175,7 +201,6 @@ export class MpesaService {
             // Fetch pending transactions with checkout_request_id older than minPendingThreshold
             const pendingTransactions = await queryRunner.manager.createQueryBuilder(MpesaTransaction, "tx")
                 .where("tx.status = :status", { status: "pending" })
-                .andWhere("tx.checkout_request_id IS NOT NULL")
                 .andWhere("tx.created_at <= :threshold", { threshold: minPendingThreshold })
                 .orderBy("tx.created_at", "ASC")
                 .take(50)
@@ -205,7 +230,7 @@ export class MpesaService {
                         lock: { mode: "pessimistic_write" },
                     });
 
-                    if (!lockedTx || lockedTx.status !== "pending" || !lockedTx.checkout_request_id) {
+                    if (!lockedTx || lockedTx.status !== "pending") {
                         await txRunner.rollbackTransaction();
                         continue;
                     }
@@ -213,7 +238,7 @@ export class MpesaService {
                     const isExceededMaxAge = new Date(lockedTx.created_at).getTime() <= maxAgeThreshold.getTime();
 
                     let queryResult: StkQueryResult | null = null;
-                    if (accessToken) {
+                    if (accessToken && lockedTx.checkout_request_id) {
                         try {
                             queryResult = await this.queryStkPushStatus(lockedTx.checkout_request_id, { accessToken });
                         } catch (queryError) {
@@ -221,13 +246,14 @@ export class MpesaService {
                         }
                     }
 
-                    if (queryResult && (queryResult.resultCode === 0 || queryResult.resultCode === 0)) {
+                    const queryOutcome = queryResult && lockedTx.checkout_request_id
+                        ? classifyStkQueryResult(queryResult, lockedTx.checkout_request_id)
+                        : "pending";
+
+                    if (queryResult && queryOutcome === "completed") {
                         // Confirmed success!
                         lockedTx.status = "completed";
                         lockedTx.result_desc = queryResult.resultDesc || "STK query confirmed payment";
-                        if (!lockedTx.mpesa_receipt_number) {
-                            lockedTx.mpesa_receipt_number = `RECON_${lockedTx.checkout_request_id.slice(-12)}`;
-                        }
                         await txRunner.manager.save(lockedTx);
 
                         // If linked to an existing sale, update payment amounts
@@ -237,10 +263,17 @@ export class MpesaService {
                                 lock: { mode: "pessimistic_write" },
                             });
                             if (sale) {
-                                sale.mpesa_amount = Number(sale.mpesa_amount || 0) + Number(lockedTx.amount);
-                                const totalPaid = Number(sale.cash_amount || 0) + sale.mpesa_amount + Number(sale.store_credit_amount || 0);
-                                sale.change_amount = Math.max(0, totalPaid - Number(sale.total_amount));
-                                sale.payment_status = totalPaid >= Number(sale.total_amount) ? "paid" : "partially_paid";
+                                const mpesaAmountCents = parseKesToCents(String(sale.mpesa_amount || 0)) +
+                                    parseKesToCents(String(lockedTx.amount));
+                                const totalPaidCents = parseKesToCents(String(sale.cash_amount || 0)) +
+                                    mpesaAmountCents +
+                                    parseKesToCents(String(sale.store_credit_amount || 0));
+                                const totalAmountCents = parseKesToCents(String(sale.total_amount));
+                                sale.mpesa_amount = Number(centsToKesString(mpesaAmountCents));
+                                sale.change_amount = Number(centsToKesString(
+                                    totalPaidCents > totalAmountCents ? totalPaidCents - totalAmountCents : 0n,
+                                ));
+                                sale.payment_status = totalPaidCents >= totalAmountCents ? "paid" : "partially_paid";
                                 await txRunner.manager.save(sale);
 
                                 await AccountingService.recordMpesaReceivablePayment(
@@ -256,7 +289,7 @@ export class MpesaService {
                         continue;
                     }
 
-                    if (queryResult && queryResult.resultCode !== undefined && TERMINAL_RESULT_CODES.has(queryResult.resultCode)) {
+                    if (queryResult && queryOutcome === "failed") {
                         // Terminal failure
                         lockedTx.status = "failed";
                         lockedTx.result_desc = queryResult.resultDesc || `M-Pesa STK query failed (ResultCode: ${queryResult.resultCode})`;
@@ -267,12 +300,12 @@ export class MpesaService {
                     }
 
                     if (isExceededMaxAge) {
-                        // Exceeded maximum allowed pending lifetime without confirmation
-                        lockedTx.status = "failed";
-                        lockedTx.result_desc = "STK push expired without callback or query confirmation";
+                        lockedTx.status = "needs_review";
+                        lockedTx.mismatch_reason = "No authoritative callback or Daraja query result was received before the reconciliation limit.";
+                        lockedTx.result_desc = "M-Pesa payment outcome is unconfirmed; verify it in Safaricom Daraja before resolving.";
                         await txRunner.manager.save(lockedTx);
                         await txRunner.commitTransaction();
-                        stats.reconciledTimedOut++;
+                        stats.reconciledNeedsReview++;
                         continue;
                     }
 
@@ -281,12 +314,14 @@ export class MpesaService {
                 } catch (txError) {
                     await txRunner.rollbackTransaction();
                     console.error(`Error reconciling transaction ${tx.id}:`, txError);
+                    throw txError;
                 } finally {
                     await txRunner.release();
                 }
             }
         } catch (error) {
             console.error("M-Pesa reconciliation cron error:", error);
+            throw error;
         } finally {
             if (lockAcquired) {
                 try {

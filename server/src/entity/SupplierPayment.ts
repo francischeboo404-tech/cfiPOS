@@ -1,9 +1,20 @@
-import { Column, CreateDateColumn, Entity, JoinColumn, ManyToOne, PrimaryGeneratedColumn } from "typeorm";
+import { Column, CreateDateColumn, Entity, Index, JoinColumn, ManyToOne, PrimaryGeneratedColumn } from "typeorm";
 import { SupplierInvoice } from "./SupplierInvoice";
 import { Vendor } from "./Vendor";
 import { User } from "./User";
 
+export enum SupplierPaymentMethod {
+    BANK_TRANSFER = "bank_transfer",
+    CASH = "cash",
+    MPESA = "mpesa",
+    CHEQUE = "cheque",
+}
+
 @Entity("supplier_payments")
+@Index("UQ_supplier_payments_idempotency_key", ["idempotency_key"], {
+    unique: true,
+    where: '"idempotency_key" IS NOT NULL',
+})
 export class SupplierPayment {
     @PrimaryGeneratedColumn("uuid")
     id: string;
@@ -23,10 +34,10 @@ export class SupplierPayment {
     vendor: Vendor;
 
     @Column("decimal", { precision: 12, scale: 2 })
-    amount: number;
+    amount: string;
 
     @Column({ default: "bank_transfer" })
-    payment_method: string;
+    payment_method: SupplierPaymentMethod;
 
     @Column({ type: "varchar", nullable: true })
     reference_number: string | null;
@@ -39,6 +50,9 @@ export class SupplierPayment {
 
     @Column()
     paid_by: string;
+
+    @Column({ type: "uuid", nullable: true })
+    idempotency_key: string | null;
 
     @ManyToOne(() => User)
     @JoinColumn({ name: "paid_by" })

@@ -50,7 +50,7 @@ export default function InventoryTransfers() {
     quantity: 0,
   });
 
-  const isAdmin = role === 'admin';
+  const canManageTransfers = role === 'admin' || role === 'manager' || role === 'supervisor';
 
   useEffect(() => {
     loadData();
@@ -129,7 +129,7 @@ export default function InventoryTransfers() {
           <h1 className="text-3xl font-bold">Inventory Transfers</h1>
           <p className="text-muted-foreground">Transfer stock between locations</p>
         </div>
-        {isAdmin && (
+        {canManageTransfers && (
           <Dialog open={dialogOpen} onOpenChange={setDialogOpen}>
             <DialogTrigger asChild>
               <Button onClick={() => resetForm()}>
@@ -262,7 +262,7 @@ export default function InventoryTransfers() {
                   </TableCell>
                   <TableCell>{new Date(transfer.created_at).toLocaleDateString()}</TableCell>
                   <TableCell className="text-right">
-                    {isAdmin && transfer.status === 'pending' && (
+                    {canManageTransfers && transfer.status === 'pending' && (
                       <Button
                         size="sm"
                         variant="outline"

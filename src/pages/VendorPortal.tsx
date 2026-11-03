@@ -13,11 +13,12 @@ import { toast } from "sonner";
 import { useAuth } from "@/hooks/useAuthContext";
 import { ApiService } from "@/lib/api";
 import { Package, FileText, MessageSquare } from "lucide-react";
+import { formatKesCents, parseKesToCents } from "@/lib/exactMoney";
 
 interface PurchaseOrder {
   id: string;
   po_number: string;
-  total_amount: number;
+  total_amount: number | string;
   status: string;
   created_at: string;
   notes: string | null;
@@ -28,7 +29,7 @@ interface Invoice {
   invoice_number: string;
   invoice_date: string;
   due_date: string | null;
-  amount: number;
+  amount: number | string;
   status: string;
   po_id: string;
 }
@@ -40,7 +41,7 @@ interface VendorPortalResponse {
     invoice_number: string;
     invoice_date: string;
     due_date: string | null;
-    total_amount: number;
+    total_amount: number | string;
     status: string;
     po_id: string;
   }>;
@@ -65,7 +66,7 @@ export default function VendorPortal() {
           invoice_number: invoice.invoice_number,
           invoice_date: invoice.invoice_date,
           due_date: invoice.due_date,
-          amount: Number(invoice.total_amount),
+          amount: invoice.total_amount,
           status: invoice.status,
           po_id: invoice.po_id,
         })),
@@ -131,10 +132,16 @@ export default function VendorPortal() {
           </CardHeader>
           <CardContent>
             <div className="text-2xl font-bold">
-              KSh{" "}
-              {orders
-                .reduce((sum, o) => sum + Number(o.total_amount), 0)
-                .toLocaleString()}
+              {formatKesCents(
+                orders.reduce(
+                  (sum, order) =>
+                    sum +
+                    BigInt(
+                      parseKesToCents(String(order.total_amount)),
+                    ),
+                  0n,
+                ),
+              )}
             </div>
           </CardContent>
         </Card>
@@ -161,7 +168,9 @@ export default function VendorPortal() {
                     {order.po_number}
                   </TableCell>
                   <TableCell>
-                    KSh {order.total_amount.toLocaleString()}
+                    {formatKesCents(
+                      parseKesToCents(String(order.total_amount)),
+                    )}
                   </TableCell>
                   <TableCell>
                     <Badge variant={getStatusColor(order.status)}>
@@ -203,7 +212,9 @@ export default function VendorPortal() {
                       {invoice.invoice_number}
                     </TableCell>
                     <TableCell>{po?.po_number || "N/A"}</TableCell>
-                    <TableCell>KSh {invoice.amount.toLocaleString()}</TableCell>
+                    <TableCell>
+                      {formatKesCents(parseKesToCents(String(invoice.amount)))}
+                    </TableCell>
                     <TableCell>
                       {new Date(invoice.invoice_date).toLocaleDateString()}
                     </TableCell>

@@ -33,3 +33,19 @@ services:
         sync: false
       - key: ETIMS_MODE
         value: "off"
+      - key: ETIMS_VSCU_BASE_URL
+        sync: false
+      - key: ETIMS_KRA_PIN
+        sync: false
+      - key: ETIMS_BRANCH_ID
+        sync: false
+      - key: ETIMS_DEVICE_SERIAL
+        sync: false
+      - key: ETIMS_INITIAL_INVOICE_NUMBER
+        sync: false
+      - key: ETIMS_PAYMENT_TYPE_CASH
+        sync: false
+      - key: ETIMS_PAYMENT_TYPE_MPESA
+        sync: false
+      - key: ETIMS_PAYMENT_TYPE_STORE_CREDIT
+        sync: false

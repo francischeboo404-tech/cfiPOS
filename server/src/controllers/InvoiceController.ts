@@ -5,6 +5,7 @@ import { Invoice, InvoiceStatus } from "../entity/Invoice";
 import { InvoicePayment } from "../entity/InvoicePayment";
 import { AccountingService } from "../services/AccountingService";
 import { getErrorMessage } from "../utils/errors";
+import { centsToKesString, parseKesToCents } from "../lib/exactMoney";
 
 const ALLOWED_PAYMENT_METHODS = new Set(["cash", "mpesa", "bank_transfer", "card", "credit", "store_credit"]);
 
@@ -14,10 +15,16 @@ export const sanitizeInvoicePaymentPayload = (input: unknown) => {
     }
 
     const payload = input as Record<string, unknown>;
-    const amount = Number(payload.amount);
-    if (!Number.isFinite(amount) || amount <= 0) {
-        throw new Error("amount must be a positive number");
+    if (typeof payload.amount !== "string" && typeof payload.amount !== "number") {
+        throw new Error("amount must be a positive KES amount with at most two decimal places");
     }
+    let amountCents: bigint;
+    try {
+        amountCents = parseKesToCents(String(payload.amount));
+    } catch {
+        throw new Error("amount must be a positive KES amount with at most two decimal places");
+    }
+    if (amountCents <= 0n) throw new Error("amount must be greater than zero");
 
     const payment_method = typeof payload.payment_method === "string" ? payload.payment_method.trim().toLowerCase() : "cash";
     if (!ALLOWED_PAYMENT_METHODS.has(payment_method)) {
@@ -29,7 +36,7 @@ export const sanitizeInvoicePaymentPayload = (input: unknown) => {
     const notes = typeof payload.notes === "string" ? payload.notes.trim().slice(0, 500) : undefined;
 
     const sanitized: Record<string, unknown> = {
-        amount,
+        amount: centsToKesString(amountCents),
         payment_method,
     };
 
@@ -81,16 +88,23 @@ export class InvoiceController {
             const receivedBy = req.user?.id as string;
 
             if (!receivedBy) {
+                await queryRunner.rollbackTransaction();
                 return res.status(401).json({ message: "Authenticated user is required" });
             }
 
-            const invoice = await queryRunner.manager.findOne(Invoice, { where: { id: invoiceId } });
+            const invoice = await queryRunner.manager.findOne(Invoice, {
+                where: { id: invoiceId },
+                lock: { mode: "pessimistic_write" },
+            });
             if (!invoice) {
+                await queryRunner.rollbackTransaction();
                 return res.status(404).json({ message: "Invoice not found" });
             }
 
-            const balanceDue = Number(invoice.balance_due ?? invoice.total_amount ?? 0);
-            if (Number(amount) > balanceDue) {
+            const amountCents = parseKesToCents(String(amount));
+            const balanceDueCents = parseKesToCents(String(invoice.balance_due ?? invoice.total_amount ?? 0));
+            if (amountCents > balanceDueCents) {
+                await queryRunner.rollbackTransaction();
                 return res.status(400).json({ message: "Payment amount exceeds invoice balance" });
             }
 
@@ -104,17 +118,21 @@ export class InvoiceController {
             payment.received_by = receivedBy;
             await queryRunner.manager.save(payment);
 
-            const paidAmount = Number(invoice.paid_amount || 0) + Number(amount);
-            invoice.paid_amount = paidAmount;
-            invoice.balance_due = Math.max(0, Number(invoice.total_amount || 0) - paidAmount);
-            invoice.status = invoice.balance_due === 0 ? InvoiceStatus.PAID : InvoiceStatus.PARTIALLY_PAID;
-            invoice.paid_at = invoice.balance_due === 0 ? new Date() : null;
+            const paidAmountCents = parseKesToCents(String(invoice.paid_amount || 0)) + amountCents;
+            const totalAmountCents = parseKesToCents(String(invoice.total_amount || 0));
+            const newBalanceCents = totalAmountCents > paidAmountCents
+                ? totalAmountCents - paidAmountCents
+                : 0n;
+            invoice.paid_amount = Number(centsToKesString(paidAmountCents));
+            invoice.balance_due = Number(centsToKesString(newBalanceCents));
+            invoice.status = newBalanceCents === 0n ? InvoiceStatus.PAID : InvoiceStatus.PARTIALLY_PAID;
+            invoice.paid_at = newBalanceCents === 0n ? new Date() : null;
             await queryRunner.manager.save(invoice);
 
             await AccountingService.recordInvoicePayment(
                 queryRunner.manager,
                 invoice.id,
-                Number(amount),
+                amountCents,
             );
 
             await queryRunner.commitTransaction();

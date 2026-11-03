@@ -84,7 +84,7 @@ test("defaults the POS to the main warehouse for opening stock", async ({ page }
   await expect(page.getByText("Stock: 7", { exact: true })).toBeVisible();
 });
 
-test("shows branch stock only and aggregates all warehouse stock in the product inventory view", async ({ page }) => {
+test("shows selected warehouse balances including zero-stock products and aggregates all warehouse stock", async ({ page }) => {
   const requestedProductUrls: string[] = [];
 
   await page.addInitScript(() => {
@@ -169,7 +169,9 @@ test("shows branch stock only and aggregates all warehouse stock in the product 
   await warehouseSelector.click();
   await page.getByRole("option", { name: "East Warehouse" }).click();
   await expect(page.getByText("3", { exact: true })).toBeVisible();
-  await expect(page.getByText("Main Only Product", { exact: true })).toHaveCount(0);
+  const mainOnlyProductRow = page.getByRole("row").filter({ hasText: "Main Only Product" });
+  await expect(mainOnlyProductRow).toBeVisible();
+  await expect(mainOnlyProductRow.getByRole("cell").nth(5)).toHaveText("0");
 
   await page.getByRole("combobox", { name: "Filter products by warehouse" }).click();
   await page.getByRole("option", { name: "Main Warehouse" }).click();
@@ -252,6 +254,60 @@ test("captures only provisional cash offline and syncs idempotently when the sam
       return;
     }
 
+    if (pathname.endsWith("/sales/server-sale-offline-e2e")) {
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({
+          sale: {
+            id: "server-sale-offline-e2e",
+            created_at: "2026-10-20T09:00:00.000Z",
+            total_amount: "100.00",
+            subtotal: "100.00",
+            tax_amount: "0.00",
+            payment_method: "cash",
+            payment_status: "paid",
+            cash_amount: "100.00",
+            mpesa_amount: null,
+            change_amount: "0.00",
+            loyalty_discount: null,
+            voucher_id: null,
+            voucher_points_redeemed: "0",
+            voucher_points_earned: "0",
+            voucher_balance_after: null,
+            voucher_expiry_date: null,
+            etims_status: "pending",
+            etims_receipt_no: null,
+            etims_qr_code: null,
+            etims_signature: null,
+            items: [{
+              quantity: 1,
+              unit_price: "100.00",
+              line_total: "100.00",
+              product: { name: "Offline Test Product", sku: "OFF-001" },
+            }],
+            customer: null,
+            cashier: {
+              id: "cashier-offline-e2e",
+              email: "offline@example.test",
+              profile: { full_name: "Offline Cashier" },
+            },
+          },
+          mpesaTransaction: null,
+        }),
+      });
+      return;
+    }
+
+    if (pathname.endsWith("/receipt-settings")) {
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({}),
+      });
+      return;
+    }
+
     await route.fulfill({ status: 200, contentType: "application/json", body: "[]" });
   });
 
@@ -266,6 +322,10 @@ test("captures only provisional cash offline and syncs idempotently when the sam
 
   await expect(page.getByTestId("offline-sale-receipt")).toBeVisible();
   await expect(page.getByText("Provisional cash receipt")).toBeVisible();
+  await expect(page.getByText("NOT YET SYNCED")).toBeVisible();
+  await expect(page.getByText("This offline capture is not fiscalized.")).toBeVisible();
+  await expect(page.getByText(/Syncing does not guarantee eTIMS submission/)).toBeVisible();
+  await expect(page.getByText(/Fiscal receipt pending.*available shortly after sync/)).toHaveCount(0);
   expect(offlinePayloads).toHaveLength(0);
 
   await page.getByRole("button", { name: "Done" }).click();
@@ -279,10 +339,14 @@ test("captures only provisional cash offline and syncs idempotently when the sam
   await expect.poll(() => offlinePayloads.length, { timeout: 20_000 }).toBe(1);
   expect(offlinePayloads[0]).toMatchObject({
     payment_method: "cash",
-    cash_amount: 116,
-    expected_total_amount: 116,
+    cash_amount: "100.00",
+    expected_total_amount: "100.00",
     items: [{ product_id: "product-offline", quantity: 1 }],
   });
   expect(typeof offlinePayloads[0].offline_created_at).toBe("string");
   expect(String(offlinePayloads[0].idempotency_key)).toMatch(/^offline_/);
+
+  await expect(page.getByText("Accepted by server; fiscal status unconfirmed")).toBeVisible();
+  await page.getByRole("button", { name: "View server receipt & fiscal status" }).click();
+  await expect(page.getByText("Fiscal receipt pending - do not treat this as a KRA tax invoice")).toBeVisible();
 });

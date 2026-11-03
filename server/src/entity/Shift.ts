@@ -33,19 +33,19 @@ export class Shift {
     status: ShiftStatus;
 
     @Column("decimal", { precision: 10, scale: 2, default: 0 })
-    opening_float: number;
+    opening_float: string;
 
     @Column("decimal", { precision: 10, scale: 2, default: 0 })
-    expected_cash: number;
+    expected_cash: string;
 
     @Column("decimal", { precision: 10, scale: 2, default: 0 })
-    actual_cash: number;
+    actual_cash: string;
 
     @Column("decimal", { precision: 10, scale: 2, default: 0 })
-    mpesa_total: number;
+    mpesa_total: string;
 
     @Column("decimal", { precision: 10, scale: 2, default: 0 })
-    total_sales: number;
+    total_sales: string;
 
     @Column("text", { nullable: true })
     notes: string;

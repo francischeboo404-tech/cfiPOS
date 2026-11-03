@@ -4,11 +4,12 @@ import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Printer, Download } from 'lucide-react';
 import { toast } from 'sonner';
+import { formatKesCents, parseKesToCents } from '@/lib/exactMoney';
 
 interface BarcodeGeneratorProps {
   value: string;
   productName?: string;
-  price?: number;
+  price?: number | string;
   sku?: string;
 }
 
@@ -46,7 +47,12 @@ export function BarcodeGenerator({ value, productName, price, sku }: BarcodeGene
     // Sanitize input data to prevent XSS
     const safeProductName = (productName || '').replace(/[<>]/g, '');
     const safeSku = (sku || '').replace(/[<>]/g, '');
-    const safePrice = price ? price.toLocaleString('en-KE', { minimumFractionDigits: 2 }).replace(/[<>]/g, '') : '';
+    const safePrice =
+      price !== undefined
+        ? formatKesCents(parseKesToCents(String(price)))
+            .replace(/^KES\s+/, '')
+            .replace(/[<>]/g, '')
+        : "";
 
     const svgElement = containerRef.current.querySelector('svg');
 
@@ -209,10 +215,10 @@ export function BarcodeGenerator({ value, productName, price, sku }: BarcodeGene
             </div>
           )}
           <svg ref={barcodeRef}></svg>
-          {price && (
+          {price !== undefined && (
             <div className="text-center">
               <p className="text-3xl font-bold text-primary">
-                KSh {price.toLocaleString('en-KE', { minimumFractionDigits: 2 })}
+                {formatKesCents(parseKesToCents(String(price)))}
               </p>
             </div>
           )}

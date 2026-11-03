@@ -12,6 +12,7 @@ import {
   RefreshCw,
   Bell,
 } from "lucide-react";
+import { formatKesCents, parseKesToCents } from "@/lib/exactMoney";
 import {
   Table,
   TableBody,
@@ -32,11 +33,11 @@ interface InventoryAlert {
 }
 
 interface SalesForecast {
-  next7Days: number;
-  next30Days: number;
+  next7Days: number | string;
+  next30Days: number | string;
   trendDirection: "increasing" | "stable" | "decreasing";
   confidence: "high" | "medium" | "low";
-  baselineDailySales: number;
+  baselineDailySales: number | string;
   historyDays: number;
   historicalTransactions: number;
   activeSalesDays: number;
@@ -224,21 +225,17 @@ export function InventoryAlerts() {
               <div className="space-y-1">
                 <p className="text-sm text-muted-foreground">Estimated next 7 days</p>
                 <p className="text-2xl font-bold">
-                  KSh{" "}
-                  {forecast.next7Days.toLocaleString("en-KE", {
-                    minimumFractionDigits: 0,
-                    maximumFractionDigits: 0,
-                  })}
+                  {formatKesCents(
+                    parseKesToCents(String(forecast.next7Days)),
+                  )}
                 </p>
               </div>
               <div className="space-y-1">
                 <p className="text-sm text-muted-foreground">Estimated next 30 days</p>
                 <p className="text-2xl font-bold">
-                  KSh{" "}
-                  {forecast.next30Days.toLocaleString("en-KE", {
-                    minimumFractionDigits: 0,
-                    maximumFractionDigits: 0,
-                  })}
+                  {formatKesCents(
+                    parseKesToCents(String(forecast.next30Days)),
+                  )}
                 </p>
               </div>
               <div className="space-y-1">
@@ -256,11 +253,10 @@ export function InventoryAlerts() {
               </div>
             </div>
             <p className="mt-4 text-xs text-muted-foreground">
-              Recent daily average: KSh{" "}
-              {forecast.baselineDailySales.toLocaleString("en-KE", {
-                minimumFractionDigits: 2,
-                maximumFractionDigits: 2,
-              })}{" "}
+              Recent daily average:{" "}
+              {formatKesCents(
+                parseKesToCents(String(forecast.baselineDailySales)),
+              )}{" "}
               across {forecast.historyDays} complete days and{" "}
               {forecast.activeSalesDays} days with sales. This is a historical
               estimate, not a guarantee.

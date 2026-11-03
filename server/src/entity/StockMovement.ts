@@ -28,6 +28,9 @@ export class StockMovement {
     @Column("decimal", { precision: 12, scale: 2, nullable: true })
     unit_cost: number | null;
 
+    @Column("bigint", { nullable: true })
+    value_change_cents: string | null;
+
     @Column({ type: "varchar" })
     reference_type: string;
 

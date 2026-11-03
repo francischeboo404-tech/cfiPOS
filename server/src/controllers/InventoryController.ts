@@ -16,6 +16,7 @@ import { InventoryService } from "../services/InventoryService";
 import { SocketService } from "../services/SocketService";
 import { getErrorMessage } from "../utils/errors";
 import { getReservedQuantity } from "../services/CheckoutReservationService";
+import { centsToKesString, divideRoundHalfUp } from "../lib/exactMoney";
 
 const ALLOWED_ADJUSTMENT_TYPES = new Set(Object.values(AdjustmentType));
 
@@ -39,8 +40,11 @@ export const sanitizeInventoryAdjustmentPayload = (input: unknown) => {
         throw new Error("type must be one of: shrinkage, damage, miscount, expiration");
     }
 
-    if (!Number.isFinite(quantity_adjusted)) {
-        throw new Error("quantity_adjusted must be a number");
+    if (!Number.isSafeInteger(quantity_adjusted) || quantity_adjusted === 0) {
+        throw new Error("quantity_adjusted must be a non-zero whole number");
+    }
+    if (type !== AdjustmentType.MISCOUNT && quantity_adjusted > 0) {
+        throw new Error("Shrinkage, damage, and expiration adjustments must reduce stock");
     }
 
     if (!reason || reason.length > 500) {
@@ -232,8 +236,12 @@ export class InventoryController {
             if (isShrinkage && Number(branchStock.stock_on_hand) - reservedBranch < absoluteQty) {
                 throw new Error("Adjustment would reduce branch stock below active checkout reservations");
             }
-            branchStock.stock_on_hand += quantity_adjusted;
-            await queryRunner.manager.save(branchStock);
+            const valuedAdjustment = await InventoryService.adjustValuedStock(
+                queryRunner.manager,
+                warehouse.id,
+                product.id,
+                quantity_adjusted,
+            );
 
             // Fetch active batches and adjust
             const batches = await queryRunner.manager.find(ProductBatch, {
@@ -264,8 +272,12 @@ export class InventoryController {
             }
 
             // Accounting
-            const unitCost = product.unit_cost || 0;
-            const totalValue = Number(unitCost) * absoluteQty;
+            const totalValueCents = valuedAdjustment.valueChangeCents < 0n
+                ? -valuedAdjustment.valueChangeCents
+                : valuedAdjustment.valueChangeCents;
+            const unitCostCents = divideRoundHalfUp(totalValueCents, BigInt(absoluteQty));
+            const unitCost = Number(centsToKesString(unitCostCents));
+            const totalValue = Number(centsToKesString(totalValueCents));
 
             const adjustment = new InventoryAdjustment();
             adjustment.product = product;
@@ -284,19 +296,32 @@ export class InventoryController {
                                     ? "damaged"
                                     : type === AdjustmentType.EXPIRATION
                                         ? "expired"
-                                        : "adjustment_out";
+                                        : type === AdjustmentType.SHRINKAGE
+                                            ? "shrinkage"
+                                            : "adjustment_out";
                         await InventoryService.recordMovement(queryRunner.manager, {
                                 productId: product.id,
                                 movementType: adjustmentMovementType,
                                 quantityChange: quantity_adjusted,
-                                quantityBefore: branchStock.stock_on_hand - quantity_adjusted,
+                                quantityBefore: valuedAdjustment.quantityBefore,
                                 locationId: warehouse.id,
                                 unitCost: Number(unitCost),
+                                valueChangeCents: valuedAdjustment.valueChangeCents,
                                 referenceType: "adjustment",
                                 referenceId: adjustment.id,
                                 notes: reason,
+                                allowNegativeBalance: valuedAdjustment.quantityBefore < 0 ||
+                                    valuedAdjustment.quantityAfter < 0,
                                 createdBy: authorizer.id,
                         });
+            await InventoryService.recordZeroQuantityCostAdjustment(
+                queryRunner.manager,
+                warehouse.id,
+                product.id,
+                authorizer.id,
+                "adjustment",
+                adjustment.id,
+            );
 
             await AccountingService.recordInventoryAdjustment(
                 queryRunner.manager,
@@ -307,7 +332,7 @@ export class InventoryController {
 
             await queryRunner.commitTransaction();
 
-            SocketService.emitInventoryUpdated(product.id, branchStock.stock_on_hand, warehouse.id);
+            SocketService.emitInventoryUpdated(product.id, valuedAdjustment.quantityAfter, warehouse.id);
 
             res.status(201).json(adjustment);
 
@@ -417,53 +442,65 @@ export class InventoryController {
                 if (!fromStock || Number(fromStock.stock_on_hand) - reservedAtSource < transfer.quantity) {
                     throw new Error("Source warehouse no longer has enough stock to complete transfer");
                 }
-                const fromQuantityBefore = fromStock.stock_on_hand;
-                fromStock.stock_on_hand -= transfer.quantity;
-                await queryRunner.manager.save(fromStock);
+                const sourceAllocation = await InventoryService.consumeValuedStock(
+                    queryRunner.manager,
+                    transfer.from_warehouse.id,
+                    transfer.product.id,
+                    transfer.quantity,
+                );
                 inventoryUpdates.push({
                     warehouseId: transfer.from_warehouse.id,
-                    stockOnHand: fromStock.stock_on_hand,
+                    stockOnHand: sourceAllocation.quantityAfter,
                 });
 
                 // Add to Destination Warehouse Stock
-                let toStock = await queryRunner.manager.findOneBy(WarehouseStock, {
+                const toQuantityBefore = Number((await queryRunner.manager.findOneBy(WarehouseStock, {
                     warehouse_id: transfer.to_warehouse.id,
-                    product_id: transfer.product.id
-                });
-                if (!toStock) {
-                    toStock = new WarehouseStock();
-                    toStock.warehouse_id = transfer.to_warehouse.id;
-                    toStock.product_id = transfer.product.id;
-                    toStock.stock_on_hand = 0;
-                }
-                const toQuantityBefore = toStock.stock_on_hand;
-                toStock.stock_on_hand += transfer.quantity;
-                await queryRunner.manager.save(toStock);
+                    product_id: transfer.product.id,
+                }))?.stock_on_hand || 0);
+                const toQuantityAfter = await InventoryService.receiveTransferValuedStock(
+                    queryRunner.manager,
+                    transfer.to_warehouse.id,
+                    transfer.product.id,
+                    transfer.quantity,
+                    sourceAllocation.cogsCents,
+                );
                 inventoryUpdates.push({
                     warehouseId: transfer.to_warehouse.id,
-                    stockOnHand: toStock.stock_on_hand,
+                    stockOnHand: toQuantityAfter,
                 });
 
                 await InventoryService.recordMovement(queryRunner.manager, {
                     productId: transfer.product.id,
                     movementType: "transfer_out",
                     quantityChange: -transfer.quantity,
-                    quantityBefore: fromQuantityBefore,
+                    quantityBefore: sourceAllocation.quantityBefore,
                     locationId: transfer.from_warehouse.id,
-                    unitCost: Number(transfer.product.unit_cost),
+                    unitCost: Number(centsToKesString(divideRoundHalfUp(sourceAllocation.cogsCents, BigInt(transfer.quantity)))),
+                    valueChangeCents: -sourceAllocation.cogsCents,
                     referenceType: "transfer",
                     referenceId: transfer.id,
                     createdBy: fulfiller.id,
                 });
+                await InventoryService.recordZeroQuantityCostAdjustment(
+                    queryRunner.manager,
+                    transfer.to_warehouse.id,
+                    transfer.product.id,
+                    fulfiller.id,
+                    "transfer",
+                    transfer.id,
+                );
                 await InventoryService.recordMovement(queryRunner.manager, {
                     productId: transfer.product.id,
                     movementType: "transfer_in",
                     quantityChange: transfer.quantity,
                     quantityBefore: toQuantityBefore,
                     locationId: transfer.to_warehouse.id,
-                    unitCost: Number(transfer.product.unit_cost),
+                    unitCost: Number(centsToKesString(divideRoundHalfUp(sourceAllocation.cogsCents, BigInt(transfer.quantity)))),
+                    valueChangeCents: sourceAllocation.cogsCents,
                     referenceType: "transfer",
                     referenceId: transfer.id,
+                    allowNegativeBalance: toQuantityBefore < 0 || toQuantityAfter < 0,
                     createdBy: fulfiller.id,
                 });
 
@@ -734,13 +771,21 @@ export class InventoryController {
                     if (Number(branchStock.stock_on_hand) + quantity_adjusted < reservedBranch) {
                         throw new Error("Stock take would reduce branch stock below active checkout reservations");
                     }
-                    const warehouseQuantityBefore = branchStock.stock_on_hand;
-                    branchStock.stock_on_hand += quantity_adjusted;
-                    await queryRunner.manager.save(branchStock);
+                    const valuedAdjustment = await InventoryService.adjustValuedStock(
+                        queryRunner.manager,
+                        stockTake.warehouse.id,
+                        item.product.id,
+                        quantity_adjusted,
+                    );
+                    branchStock.stock_on_hand = valuedAdjustment.quantityAfter;
 
                     // Create Inventory Adjustment record
-                    const unitCost = item.product.unit_cost || 0;
-                    const totalValue = Number(unitCost) * absoluteQty;
+                    const totalValueCents = valuedAdjustment.valueChangeCents < 0n
+                        ? -valuedAdjustment.valueChangeCents
+                        : valuedAdjustment.valueChangeCents;
+                    const unitCostCents = divideRoundHalfUp(totalValueCents, BigInt(absoluteQty));
+                    const unitCost = Number(centsToKesString(unitCostCents));
+                    const totalValue = Number(centsToKesString(totalValueCents));
 
                     const adjustment = new InventoryAdjustment();
                     adjustment.product = item.product;
@@ -757,14 +802,25 @@ export class InventoryController {
                         productId: item.product.id,
                         movementType: quantity_adjusted > 0 ? "adjustment_in" : "adjustment_out",
                         quantityChange: quantity_adjusted,
-                        quantityBefore: warehouseQuantityBefore,
+                        quantityBefore: valuedAdjustment.quantityBefore,
                         locationId: stockTake.warehouse.id,
                         unitCost: Number(unitCost),
+                        valueChangeCents: valuedAdjustment.valueChangeCents,
                         referenceType: "adjustment",
                         referenceId: adjustment.id,
                         notes: adjustment.reason,
+                        allowNegativeBalance: valuedAdjustment.quantityBefore < 0 ||
+                            valuedAdjustment.quantityAfter < 0,
                         createdBy: completer.id,
                     });
+                    await InventoryService.recordZeroQuantityCostAdjustment(
+                        queryRunner.manager,
+                        stockTake.warehouse.id,
+                        item.product.id,
+                        completer.id,
+                        "stock_take",
+                        stockTake.id,
+                    );
 
                     // Accounting
                     await AccountingService.recordInventoryAdjustment(

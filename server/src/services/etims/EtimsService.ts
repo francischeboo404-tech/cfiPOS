@@ -8,6 +8,7 @@ import {
     OffEtimsProvider,
     MockEtimsProvider,
     LiveEtimsProvider,
+    ETIMS_LIVE_MODE_AVAILABLE,
 } from "./EtimsProvider";
 import { SocketService } from "../SocketService";
 import { EtimsMockService } from "../EtimsMockService";
@@ -23,6 +24,11 @@ export class EtimsService {
     static resolveEtimsMode(): EtimsMode {
         const rawMode = (process.env.ETIMS_MODE || "").trim().toLowerCase();
         if (rawMode === "off" || rawMode === "mock" || rawMode === "live") {
+            if (rawMode === "live" && !ETIMS_LIVE_MODE_AVAILABLE) {
+                throw new Error(
+                    "Live eTIMS is disabled until the KRA VSCU integration is implemented and verified. Use ETIMS_MODE=off or mock.",
+                );
+            }
             return rawMode as EtimsMode;
         }
 
@@ -115,11 +121,15 @@ export class EtimsService {
             }
         } catch (error) {
             const message = error instanceof Error ? error.message : String(error);
-            sale.etims_last_error = message;
-            if (sale.etims_attempts >= 5) {
+            if (provider.mode === "live") {
                 sale.etims_status = EtimsStatus.FAILED;
+                sale.etims_last_error = `${message} Live submission outcome may be uncertain. Reconcile invoice ${sale.etims_invoice_number || "number unavailable"} with the VSCU daemon before retrying.`;
+            } else if (sale.etims_attempts >= 5) {
+                sale.etims_status = EtimsStatus.FAILED;
+                sale.etims_last_error = message;
             } else {
                 sale.etims_status = EtimsStatus.PENDING;
+                sale.etims_last_error = message;
             }
         }
 
@@ -175,11 +185,15 @@ export class EtimsService {
             }
         } catch (error) {
             const message = error instanceof Error ? error.message : String(error);
-            creditNote.etims_last_error = message;
-            if (creditNote.etims_attempts >= 5) {
+            if (provider.mode === "live") {
                 creditNote.etims_status = EtimsStatus.FAILED;
+                creditNote.etims_last_error = `${message} Live submission outcome may be uncertain. Reconcile the credit note with the VSCU daemon before retrying.`;
+            } else if (creditNote.etims_attempts >= 5) {
+                creditNote.etims_status = EtimsStatus.FAILED;
+                creditNote.etims_last_error = message;
             } else {
                 creditNote.etims_status = EtimsStatus.PENDING;
+                creditNote.etims_last_error = message;
             }
         }
 

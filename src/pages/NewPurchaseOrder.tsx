@@ -15,6 +15,11 @@ import {
 import { toast } from "sonner";
 import { ArrowLeft, Plus, Trash2 } from "lucide-react";
 import { useAuth } from "@/hooks/useAuthContext";
+import {
+  centsToKesString,
+  formatKesCents,
+  parseKesToCents,
+} from "@/lib/exactMoney";
 
 interface Vendor {
   id: string;
@@ -36,7 +41,7 @@ interface Warehouse {
 interface POItem {
   product_id: string;
   quantity: number;
-  unit_cost: number;
+  unit_cost: string;
 }
 
 export default function NewPurchaseOrder() {
@@ -49,7 +54,7 @@ export default function NewPurchaseOrder() {
   const [vendorId, setVendorId] = useState("");
   const [warehouseId, setWarehouseId] = useState("");
   const [items, setItems] = useState<POItem[]>([
-    { product_id: "", quantity: 1, unit_cost: 0 },
+    { product_id: "", quantity: 1, unit_cost: "0.00" },
   ]);
 
   useEffect(() => {
@@ -91,7 +96,7 @@ export default function NewPurchaseOrder() {
   };
 
   const addItem = () => {
-    setItems([...items, { product_id: "", quantity: 1, unit_cost: 0 }]);
+    setItems([...items, { product_id: "", quantity: 1, unit_cost: "0.00" }]);
   };
 
   const removeItem = (index: number) => {
@@ -100,20 +105,34 @@ export default function NewPurchaseOrder() {
 
   const updateItem = (index: number, field: keyof POItem, value: string | number) => {
     const newItems = [...items];
-    newItems[index] = { ...newItems[index], [field]: value };
+    newItems[index] = {
+      ...newItems[index],
+      [field]: field === "unit_cost" ? String(value) : value,
+    };
 
     if (field === "product_id") {
       const product = products.find((p) => p.id === value);
       if (product) {
-        newItems[index].unit_cost = product.unit_cost;
+        newItems[index].unit_cost = String(product.unit_cost);
       }
     }
 
     setItems(newItems);
   };
 
-  const calculateTotal = () => {
-    return items.reduce((sum, item) => sum + item.quantity * item.unit_cost, 0);
+  const calculateLineCents = (item: POItem): bigint | null => {
+    if (!Number.isSafeInteger(item.quantity) || item.quantity <= 0) return null;
+    try {
+      return BigInt(item.quantity) * BigInt(parseKesToCents(item.unit_cost));
+    } catch {
+      return null;
+    }
+  };
+
+  const calculateTotalCents = (): bigint | null => {
+    const lineValues = items.map(calculateLineCents);
+    if (lineValues.some((value) => value === null)) return null;
+    return lineValues.reduce((sum, value) => sum + (value ?? 0n), 0n);
   };
 
   const handleSubmit = async (e: React.FormEvent) => {
@@ -124,21 +143,23 @@ export default function NewPurchaseOrder() {
       return;
     }
 
-    if (items.some((item) => !item.product_id || item.quantity <= 0)) {
-      toast.error("Please fill all item details");
+    if (items.some((item) => !item.product_id || calculateLineCents(item) === null)) {
+      toast.error("Please fill all item details with valid quantities and cent-precision unit costs");
       return;
     }
 
     setLoading(true);
 
     try {
-      const totalAmount = calculateTotal();
+      const safeItems = items.map((item) => ({
+        ...item,
+        unit_cost: centsToKesString(parseKesToCents(item.unit_cost)),
+      }));
 
       await ApiService.post("/purchase-orders", {
         vendor_id: vendorId,
         warehouse_id: warehouseId,
-        total_amount: totalAmount,
-        items: items,
+        items: safeItems,
         created_by: user?.id,
       });
 
@@ -255,11 +276,11 @@ export default function NewPurchaseOrder() {
                   </Label>
                   <Input
                     id={`po-unit-cost-${index}`}
-                    type="number"
-                    step="0.01"
+                    type="text"
+                    inputMode="decimal"
                     value={item.unit_cost}
                     onChange={(e) =>
-                      updateItem(index, "unit_cost", parseFloat(e.target.value))
+                      updateItem(index, "unit_cost", e.target.value)
                     }
                   />
                 </div>
@@ -267,7 +288,11 @@ export default function NewPurchaseOrder() {
                   <Label htmlFor={`po-line-total-${index}`}>Total</Label>
                   <Input
                     id={`po-line-total-${index}`}
-                    value={(item.quantity * item.unit_cost).toFixed(2)}
+                    value={
+                      calculateLineCents(item) === null
+                        ? "Invalid amount"
+                        : formatKesCents(calculateLineCents(item) ?? 0n)
+                    }
                     disabled
                   />
                 </div>
@@ -290,10 +315,9 @@ export default function NewPurchaseOrder() {
                   Total Amount
                 </div>
                 <div className="text-2xl font-bold">
-                  KSh{" "}
-                  {calculateTotal().toLocaleString("en-KE", {
-                    minimumFractionDigits: 2,
-                  })}
+                  {calculateTotalCents() === null
+                    ? "Invalid amount"
+                    : formatKesCents(calculateTotalCents() ?? 0n)}
                 </div>
               </div>
             </div>

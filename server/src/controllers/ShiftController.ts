@@ -4,20 +4,22 @@ import { AppDataSource } from "../data-source";
 import { Shift, ShiftStatus } from "../entity/Shift";
 import { User } from "../entity/User";
 import { Sale, SaleStatus } from "../entity/Sale";
-import { Between, In, IsNull } from "typeorm";
+import { Between, In } from "typeorm";
 import { ReturnRequest, ReturnStatus, RefundMethod, MpesaRefundStatus } from "../entity/ReturnRequest";
 import { CreditNote } from "../entity/CreditNote";
 import { MpesaTransaction } from "../entity/MpesaTransaction";
+import { VoucherRenewal } from "../entity/VoucherRenewal";
 import { getErrorMessage } from "../utils/errors";
+import { centsToKesString, divideRoundHalfUp, parseKesToCents } from "../lib/exactMoney";
 
 const shiftRepo = AppDataSource.getRepository(Shift);
 
 export const sanitizeShiftCurrency = (value: unknown, fieldName: string) => {
-    const parsed = Number(value);
-    if (!Number.isFinite(parsed) || parsed < 0) {
-        throw new Error(`${fieldName} must be a non-negative number`);
+    const input = String(value).trim();
+    if (!/^\d+(?:\.\d{1,2})?$/.test(input)) {
+        throw new Error(`${fieldName} must be a non-negative number with at most two decimal places`);
     }
-    return Number(parsed.toFixed(2));
+    return centsToKesString(parseKesToCents(input));
 };
 
 export class ShiftController {
@@ -93,17 +95,26 @@ export class ShiftController {
 
             const parsedActualCash = sanitizeShiftCurrency(actual_cash, "actual_cash");
             const sanitizedNotes = typeof notes === "string" ? notes.trim().slice(0, 500) : "";
-            const unresolvedPayments = await queryRunner.manager.find(MpesaTransaction, {
-                where: [
-                    { cashier_id: shift.cashier_id, status: "pending" },
-                    { cashier_id: shift.cashier_id, status: "completed", sale_id: IsNull() },
-                ],
-                lock: { mode: "pessimistic_write" },
-            });
+            const unresolvedPayments = await queryRunner.manager.createQueryBuilder(MpesaTransaction, "payment")
+                .setLock("pessimistic_write")
+                .where(`payment."cashier_id" = :cashierId`, { cashierId: shift.cashier_id })
+                .andWhere(`(
+                    payment."status" IN ('pending', 'needs_review') OR
+                    (payment."status" = 'completed' AND payment."sale_id" IS NULL AND NOT EXISTS (
+                        SELECT 1
+                        FROM "payment_checkout_sessions" checkout
+                        JOIN "voucher_renewals" renewal
+                            ON renewal."checkout_session_id" = checkout."id"
+                        WHERE checkout."id" = payment."checkout_session_id"
+                            AND checkout."purpose" = 'voucher_renewal'
+                            AND checkout."status" = 'completed'
+                    ))
+                )`)
+                .getMany();
             if (unresolvedPayments.length > 0) {
                 await queryRunner.rollbackTransaction();
                 return res.status(409).json({
-                    message: "Resolve pending M-Pesa payments and finalize completed checkouts before closing this shift.",
+                    message: "Resolve pending or review-required M-Pesa payments and finalize completed checkouts before closing this shift.",
                 });
             }
 
@@ -118,14 +129,27 @@ export class ShiftController {
                 }
             });
 
-            let expected_cash = Number(shift.opening_float);
-            let mpesa_total = 0;
-            let total_sales = 0;
+            let expectedCashCents = parseKesToCents(String(shift.opening_float));
+            let mpesaTotalCents = 0n;
+            let totalSalesCents = 0n;
 
             for (const sale of sales) {
-                expected_cash += Math.max(0, Number(sale.cash_amount) - Number(sale.change_amount || 0));
-                mpesa_total += Number(sale.mpesa_amount);
-                total_sales += Number(sale.total_amount);
+                const saleCashCents = parseKesToCents(String(sale.cash_amount));
+                const changeCents = parseKesToCents(String(sale.change_amount || 0));
+                expectedCashCents += saleCashCents > changeCents ? saleCashCents - changeCents : 0n;
+                mpesaTotalCents += parseKesToCents(String(sale.mpesa_amount));
+                totalSalesCents += parseKesToCents(String(sale.total_amount));
+            }
+            const voucherRenewals = await queryRunner.manager.find(VoucherRenewal, {
+                where: {
+                    renewed_by: shift.cashier_id,
+                    renewed_at: Between(shift.start_time, shift.end_time),
+                },
+            });
+            for (const renewal of voucherRenewals) {
+                expectedCashCents += BigInt(renewal.cash_paid_cents || "0");
+                mpesaTotalCents += BigInt(renewal.mpesa_paid_cents || "0");
+                totalSalesCents += BigInt(renewal.fee_cents);
             }
 
             const refunds = await queryRunner.manager.find(ReturnRequest, {
@@ -156,30 +180,33 @@ export class ShiftController {
             const refundAmounts = new Map(
                 creditNotes
                     .filter((creditNote) => creditNote.return_request)
-                    .map((creditNote) => [creditNote.return_request!.id, Number(creditNote.amount)]),
+                    .map((creditNote) => [creditNote.return_request!.id, parseKesToCents(String(creditNote.amount))]),
             );
 
             for (const returnRequest of refunds) {
                 if (returnRequest.refund_method === RefundMethod.CASH) {
                     const recordedRefundAmount = refundAmounts.get(returnRequest.id);
                     if (recordedRefundAmount !== undefined) {
-                        expected_cash -= recordedRefundAmount;
+                        expectedCashCents -= recordedRefundAmount;
                     } else {
                         for (const returnItem of returnRequest.items) {
                             const saleItem = returnItem.sale_item;
-                            const returnedSubtotal = Number(saleItem.line_total) / saleItem.quantity * returnItem.quantity;
-                            expected_cash -= returnedSubtotal * (1 + Number(saleItem.tax_rate) / 100);
+                            const lineTotalCents = parseKesToCents(String(saleItem.line_total));
+                            expectedCashCents -= divideRoundHalfUp(
+                                lineTotalCents * BigInt(returnItem.quantity),
+                                BigInt(saleItem.quantity),
+                            );
                         }
                     }
                 }
                 if (returnRequest.refund_method === RefundMethod.MPESA) {
-                    mpesa_total -= Number(returnRequest.mpesa_refund_amount);
+                    mpesaTotalCents -= parseKesToCents(String(returnRequest.mpesa_refund_amount));
                 }
             }
 
-            shift.expected_cash = expected_cash;
-            shift.mpesa_total = mpesa_total;
-            shift.total_sales = total_sales;
+            shift.expected_cash = centsToKesString(expectedCashCents);
+            shift.mpesa_total = centsToKesString(mpesaTotalCents);
+            shift.total_sales = centsToKesString(totalSalesCents);
             shift.actual_cash = parsedActualCash;
             shift.notes = sanitizedNotes;
             shift.status = ShiftStatus.CLOSED;

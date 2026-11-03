@@ -3,6 +3,8 @@ import { Button } from '@/components/ui/button';
 import { Card, CardContent } from '@/components/ui/card';
 import { Printer, Download } from 'lucide-react';
 import cfiLogo from '@/assets/cfi-pos-techiez-logo.png';
+import { getEtimsReceiptNotice, isTestEtimsReceipt } from '@/lib/etimsReceipt';
+import { EtimsQrCode } from '@/components/EtimsQrCode';
 
 interface ReceiptItem {
   name: string;
@@ -45,6 +47,8 @@ export function EnhancedReceipt({
   etims_signature,
 }: EnhancedReceiptProps) {
   const receiptRef = useRef<HTMLDivElement>(null);
+  const isTestFiscalReceipt = isTestEtimsReceipt(etims_receipt_no);
+  const etimsNotice = getEtimsReceiptNotice(etims_status, etims_receipt_no);
 
   const handlePrint = () => {
     window.print();
@@ -157,49 +161,59 @@ export function EnhancedReceipt({
           <div className="border-t-2 border-dashed pt-3 text-center text-xs space-y-1">
             {etims_status === "submitted" && etims_receipt_no ? (
               <div className="space-y-1">
-                <div className="font-semibold text-primary">KRA eTIMS Fiscal Receipt</div>
-                <div className="font-mono text-[11px]">Invoice No: {etims_receipt_no}</div>
+                <div className="font-semibold text-primary">
+                  {isTestFiscalReceipt
+                    ? "TEST eTIMS SIMULATION - NOT A TAX INVOICE"
+                    : "eTIMS Submission Recorded - Verification Required"}
+                </div>
+                <div className="font-mono text-[11px]">
+                  {isTestFiscalReceipt ? "Test reference" : "Receipt reference"}: {etims_receipt_no}
+                </div>
                 {etims_signature && (
                   <div className="font-mono text-[10px] text-muted-foreground break-all">
-                    Sig: {etims_signature}
+                    {isTestFiscalReceipt ? "Test signature (simulation)" : "Sig"}: {etims_signature}
                   </div>
                 )}
                 {etims_qr_code && (
                   <div className="py-2 flex flex-col items-center justify-center">
-                    <img
-                      src={`https://api.qrserver.com/v1/create-qr-code/?size=110x110&data=${encodeURIComponent(etims_qr_code)}`}
-                      alt="eTIMS Verification QR"
-                      className="w-24 h-24 mx-auto border p-1 rounded bg-white"
-                      loading="lazy"
+                    <EtimsQrCode
+                      value={etims_qr_code}
+                      label={
+                        isTestFiscalReceipt
+                          ? "Test eTIMS QR code - not valid for KRA verification"
+                          : "eTIMS QR code - submission not independently verified"
+                      }
                     />
-                    <a
-                      href={etims_qr_code}
-                      target="_blank"
-                      rel="noopener noreferrer"
-                      className="text-[10px] text-blue-600 underline mt-1 break-all"
-                    >
-                      Verify with KRA
-                    </a>
+                    {isTestFiscalReceipt && (
+                      <span className="text-[10px] text-muted-foreground mt-1">
+                        Test QR only - not valid for KRA verification
+                      </span>
+                    )}
                   </div>
                 )}
               </div>
             ) : etims_status === "pending" ? (
               <div className="text-amber-600 dark:text-amber-400 font-medium py-1">
-                Fiscal receipt pending - receipt will be available shortly
+                Fiscal receipt pending - do not treat this as a KRA tax invoice
               </div>
             ) : etims_status === "failed" ? (
               <div className="text-destructive font-medium py-1">
-                Fiscal submission pending verification
+                Fiscal receipt not confirmed - reconcile before treating as a tax invoice
               </div>
             ) : (
               <div className="text-muted-foreground italic py-1">
-                Non-fiscal receipt
+                CUSTOMER RECEIPT - NOT A KRA TAX INVOICE
               </div>
             )}
           </div>
 
           {/* Footer */}
           <div className="text-center text-xs text-muted-foreground border-t-2 border-dashed pt-4 mt-4">
+            {etimsNotice ? (
+              <p className="mb-1 font-semibold text-amber-700 dark:text-amber-400">
+                {etimsNotice}
+              </p>
+            ) : null}
             <p className="mb-1">Thank you for your business!</p>
             <p className="mb-1">Goods once sold cannot be returned</p>
             <p className="text-[10px] mt-2">Powered by CFI-POS Techiez</p>

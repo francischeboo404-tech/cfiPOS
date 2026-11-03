@@ -6,6 +6,8 @@ import { ReturnRequest, ReturnStatus, RefundMethod, MpesaRefundStatus } from "..
 import { ReturnItem, ReturnItemCondition } from "../entity/ReturnItem";
 import { SaleItem } from "../entity/SaleItem";
 import { SaleItemBatch } from "../entity/SaleItemBatch";
+import { PromotionItem } from "../entity/PromotionItem";
+import { PromotionAuditEvent } from "../entity/PromotionAuditEvent";
 import { User, AppRole } from "../entity/User";
 import { CreditNote } from "../entity/CreditNote";
 import { ProductBatch } from "../entity/ProductBatch";
@@ -21,6 +23,15 @@ import { Customer } from "../entity/Customer";
 import { Invoice } from "../entity/Invoice";
 import crypto from "crypto";
 import { In } from "typeorm";
+import { VoucherService } from "../services/VoucherService";
+import {
+    allocateQuantityShare,
+    centsToKesString,
+    divideRoundHalfUp,
+    parseKesDecimalToCents,
+    parseKesToCents,
+    percentageToBasisPoints,
+} from "../lib/exactMoney";
 
 const saleRepository = AppDataSource.getRepository(Sale);
 const returnRepository = AppDataSource.getRepository(ReturnRequest);
@@ -223,6 +234,7 @@ export class ReturnController {
                     relations: ["return_request", "sale_item"],
                 });
                 const returnedQuantity = new Map<string, number>();
+                const approvedReturnedQuantity = new Map<string, number>();
                 for (const previousReturn of previousReturns) {
                     if (previousReturn.return_request.status !== ReturnStatus.PENDING &&
                         previousReturn.return_request.status !== ReturnStatus.APPROVED) {
@@ -233,6 +245,12 @@ export class ReturnController {
                         saleItemId,
                         (returnedQuantity.get(saleItemId) || 0) + previousReturn.quantity,
                     );
+                    if (previousReturn.return_request.status === ReturnStatus.APPROVED) {
+                        approvedReturnedQuantity.set(
+                            saleItemId,
+                            (approvedReturnedQuantity.get(saleItemId) || 0) + previousReturn.quantity,
+                        );
+                    }
                 }
 
                 if (!(sale.items || []).some((item) =>
@@ -240,9 +258,14 @@ export class ReturnController {
                     continue;
                 }
 
+                const returnableItems = sale.items.map((item) => Object.assign(item, {
+                    returnable_quantity: item.quantity - (returnedQuantity.get(item.id) || 0),
+                    approved_returned_quantity: approvedReturnedQuantity.get(item.id) || 0,
+                }));
                 results.push(Object.assign(sale, {
                     invoice_number: invoice.invoice_number,
                     customer: invoice.customer,
+                    items: returnableItems,
                 }));
             }
 
@@ -394,8 +417,9 @@ export class ReturnController {
 
             const inventoryUpdates: { productId: string; newStockLevel: number; warehouseId: string | null }[] = [];
             let calculatedTotalCogs = 0;
-            let currentReturnedTaxWeight = 0;
-            let grossSubtotalRefundCents = 0;
+            let calculatedTotalCogsCents = 0n;
+            let subtotalRefundCents = 0n;
+            let taxRefundCents = 0n;
             const previousApprovedReturnItems = await queryRunner.manager.createQueryBuilder(ReturnItem, "returnItem")
                 .innerJoin("returnItem.return_request", "returnRequest")
                 .innerJoinAndSelect("returnItem.sale_item", "saleItem")
@@ -404,11 +428,31 @@ export class ReturnController {
                 .andWhere("returnRequest.id != :requestId", { requestId })
                 .getMany();
             const previousReturnedQuantityBySaleItem = new Map<string, number>();
+            let previousRefundCents = 0n;
             for (const previousItem of previousApprovedReturnItems) {
                 const saleItemId = previousItem.sale_item.id;
+                const returnedBefore = previousReturnedQuantityBySaleItem.get(saleItemId) || 0;
+                const lineGrossCents = BigInt(previousItem.sale_item.line_total_cents ??
+                    parseKesToCents(String(previousItem.sale_item.line_total)).toString());
+                const lineDiscountCents = BigInt(previousItem.sale_item.discount_cents || "0");
+                const lineNetCents = previousItem.sale_item.net_revenue_cents !== null
+                    ? BigInt(previousItem.sale_item.net_revenue_cents)
+                    : lineGrossCents - lineDiscountCents;
+                const lineVatCents = previousItem.sale_item.vat_cents !== null
+                    ? BigInt(previousItem.sale_item.vat_cents)
+                    : divideRoundHalfUp(
+                        lineGrossCents * BigInt(percentageToBasisPoints(String(previousItem.sale_item.tax_rate))),
+                        10_000n,
+                    );
+                previousRefundCents += allocateQuantityShare(
+                    lineNetCents + lineVatCents,
+                    previousItem.sale_item.quantity,
+                    returnedBefore,
+                    previousItem.quantity,
+                );
                 previousReturnedQuantityBySaleItem.set(
                     saleItemId,
-                    (previousReturnedQuantityBySaleItem.get(saleItemId) || 0) + previousItem.quantity,
+                    returnedBefore + previousItem.quantity,
                 );
             }
 
@@ -423,64 +467,145 @@ export class ReturnController {
                 }
                 retItem.condition = condition;
 
-                const grossRefundCents = Math.round(Number(saleItem.unit_price) * 100) * retItem.quantity;
-                const refundAmount = grossRefundCents / 100;
                 const returnedQuantityBefore = previousReturnedQuantityBySaleItem.get(saleItem.id) || 0;
-                const totalCogsCents = Math.round(Number(
-                    saleItem.cogs_total ?? Number(saleItem.unit_cost ?? product.unit_cost ?? 0) * saleItem.quantity,
-                ) * 100);
-                const cogsBeforeCents = Math.round(totalCogsCents * returnedQuantityBefore / saleItem.quantity);
-                const cogsAfterCents = Math.round(
-                    totalCogsCents * (returnedQuantityBefore + retItem.quantity) / saleItem.quantity,
+                const lineGrossCents = BigInt(
+                    saleItem.line_total_cents ?? parseKesToCents(String(saleItem.line_total)).toString(),
                 );
-                const itemCogs = (cogsAfterCents - cogsBeforeCents) / 100;
+                const lineDiscountCents = BigInt(saleItem.discount_cents || "0");
+                const lineNetCents = saleItem.net_revenue_cents !== null
+                    ? BigInt(saleItem.net_revenue_cents)
+                    : lineGrossCents - lineDiscountCents;
+                const lineVatCents = saleItem.vat_cents !== null
+                    ? BigInt(saleItem.vat_cents)
+                    : divideRoundHalfUp(
+                        lineGrossCents * BigInt(percentageToBasisPoints(String(saleItem.tax_rate))),
+                        10_000n,
+                    );
+                const returnedNetCents = allocateQuantityShare(
+                    lineNetCents,
+                    saleItem.quantity,
+                    returnedQuantityBefore,
+                    retItem.quantity,
+                );
+                const returnedVatCents = allocateQuantityShare(
+                    lineVatCents,
+                    saleItem.quantity,
+                    returnedQuantityBefore,
+                    retItem.quantity,
+                );
+                const totalCogsCents = saleItem.cogs_total_cents !== null
+                    ? BigInt(saleItem.cogs_total_cents)
+                    : saleItem.cogs_total !== null
+                        ? parseKesToCents(String(saleItem.cogs_total))
+                        : saleItem.unit_cost !== null
+                            ? parseKesToCents(String(saleItem.unit_cost)) * BigInt(saleItem.quantity)
+                            : (() => { throw new Error("Original sale cost is unavailable; return cannot be valued accurately"); })();
+                const itemCogsCents = allocateQuantityShare(
+                    totalCogsCents,
+                    saleItem.quantity,
+                    returnedQuantityBefore,
+                    retItem.quantity,
+                );
+                const itemCogs = Number(centsToKesString(itemCogsCents));
                 previousReturnedQuantityBySaleItem.set(
                     saleItem.id,
                     returnedQuantityBefore + retItem.quantity,
                 );
 
-                grossSubtotalRefundCents += grossRefundCents;
-                currentReturnedTaxWeight += refundAmount * Number(saleItem.tax_rate) / 100;
-                calculatedTotalCogs += itemCogs;
+                if (saleItem.promotion_item_id && saleItem.promotion_quantity) {
+                    const returnedPromotionQuantity = Number(allocateQuantityShare(
+                        BigInt(saleItem.promotion_quantity),
+                        saleItem.quantity,
+                        returnedQuantityBefore,
+                        retItem.quantity,
+                    ));
+                    if (returnedPromotionQuantity > 0) {
+                        const promotionItem = await queryRunner.manager.findOne(PromotionItem, {
+                            where: { id: saleItem.promotion_item_id },
+                            relations: ["promotion"],
+                            lock: { mode: "pessimistic_write" },
+                        });
+                        if (!promotionItem || promotionItem.used_qty < returnedPromotionQuantity) {
+                            throw new Error("Promotion quota cannot be restored accurately for this return");
+                        }
+                        const usedQtyBeforeReturn = promotionItem.used_qty;
+                        promotionItem.used_qty -= returnedPromotionQuantity;
+                        await queryRunner.manager.save(promotionItem);
+                        await queryRunner.manager.save(queryRunner.manager.create(PromotionAuditEvent, {
+                            promotion: promotionItem.promotion,
+                            actor: admin,
+                            action: "sale_reversed",
+                            before_state: {
+                                promotion_item_id: promotionItem.id,
+                                used_qty: usedQtyBeforeReturn,
+                            },
+                            after_state: {
+                                promotion_item_id: promotionItem.id,
+                                return_request_id: returnReq.id,
+                                sale_id: sale.id,
+                                quantity_restored: returnedPromotionQuantity,
+                                used_qty: promotionItem.used_qty,
+                            },
+                            reason: returnReq.reason,
+                        }));
+                    }
+                }
+
+                subtotalRefundCents += returnedNetCents;
+                taxRefundCents += returnedVatCents;
+                calculatedTotalCogsCents += itemCogsCents;
+                calculatedTotalCogs = Number(centsToKesString(calculatedTotalCogsCents));
+                retItem.net_revenue_cents = String(returnedNetCents);
+                retItem.vat_cents = String(returnedVatCents);
+                retItem.cogs_total_cents = String(itemCogsCents);
 
                 if (retItem.condition === ReturnItemCondition.SELLABLE) {
-                    const aggregateQuantityBefore = Number(product.stock_on_hand);
-                    product.stock_on_hand += retItem.quantity;
-                    await queryRunner.manager.save(product);
-
-                    let movementQuantityBefore = aggregateQuantityBefore;
                     let movementLocationId: string | null = null;
                     let branchStockAfter: number | null = null;
                     if (sale.warehouse) {
-                        let branchStock = await queryRunner.manager.findOneBy(WarehouseStock, {
-                            warehouse_id: sale.warehouse.id,
-                            product_id: product.id
-                        });
-                        if (!branchStock) {
-                            branchStock = queryRunner.manager.create(WarehouseStock, {
-                                warehouse_id: sale.warehouse.id,
-                                product_id: product.id,
-                                stock_on_hand: 0,
-                            });
-                        }
-                        movementQuantityBefore = branchStock.stock_on_hand;
-                        branchStock.stock_on_hand += retItem.quantity;
-                        await queryRunner.manager.save(branchStock);
-                        branchStockAfter = Number(branchStock.stock_on_hand);
+                        branchStockAfter = await InventoryService.restoreValuedStock(
+                            queryRunner.manager,
+                            sale.warehouse.id,
+                            product.id,
+                            retItem.quantity,
+                            itemCogsCents,
+                        );
+                        product.stock_on_hand += retItem.quantity;
                         movementLocationId = sale.warehouse.id;
+                    } else {
+                        product.stock_on_hand += retItem.quantity;
                     }
+                    await queryRunner.manager.save(product);
 
+                    const returnMovementQuantityBefore = branchStockAfter === null
+                        ? Number(product.stock_on_hand) - retItem.quantity
+                        : branchStockAfter - retItem.quantity;
                     await InventoryService.recordMovement(queryRunner.manager, {
                         productId: product.id,
                         movementType: "sale_return",
                         quantityChange: retItem.quantity,
-                        quantityBefore: movementQuantityBefore,
+                        quantityBefore: returnMovementQuantityBefore,
                         locationId: movementLocationId,
-                        unitCost: itemCogs / retItem.quantity,
+                        unitCost: Number(centsToKesString(
+                            divideRoundHalfUp(itemCogsCents, BigInt(retItem.quantity)),
+                        )),
+                        valueChangeCents: itemCogsCents,
                         referenceType: "return",
                         referenceId: returnReq.id,
+                        allowNegativeBalance: returnMovementQuantityBefore < 0 ||
+                            returnMovementQuantityBefore + retItem.quantity < 0,
                         createdBy: admin.id,
                     });
+                    if (sale.warehouse) {
+                        await InventoryService.recordZeroQuantityCostAdjustment(
+                            queryRunner.manager,
+                            sale.warehouse.id,
+                            product.id,
+                            admin.id,
+                            "return",
+                            returnReq.id,
+                        );
+                    }
 
                     let qtyToReturn = retItem.quantity;
                     const saleItemBatches = await queryRunner.manager.find(SaleItemBatch, {
@@ -518,7 +643,48 @@ export class ReturnController {
                         warehouseId: sale.warehouse ? sale.warehouse.id : null
                     });
                 } else if (retItem.condition === ReturnItemCondition.DAMAGED) {
-                    // Damaged goods are written off automatically as Inventory Shrinkage
+                    let movementQuantityBefore = Number(product.stock_on_hand);
+                    let movementLocationId: string | null = null;
+                    if (sale.warehouse) {
+                        const branchStock = await queryRunner.manager.findOne(WarehouseStock, {
+                            where: { warehouse_id: sale.warehouse.id, product_id: product.id },
+                            lock: { mode: "pessimistic_write" },
+                        });
+                        movementQuantityBefore = Number(branchStock?.stock_on_hand || 0);
+                        movementLocationId = sale.warehouse.id;
+                    }
+                    const movementUnitCost = Number(centsToKesString(
+                        divideRoundHalfUp(itemCogsCents, BigInt(retItem.quantity)),
+                    ));
+                    await InventoryService.recordMovement(queryRunner.manager, {
+                        productId: product.id,
+                        movementType: "sale_return",
+                        quantityChange: retItem.quantity,
+                        quantityBefore: movementQuantityBefore,
+                        locationId: movementLocationId,
+                        unitCost: movementUnitCost,
+                        valueChangeCents: itemCogsCents,
+                        referenceType: "return",
+                        referenceId: returnReq.id,
+                        allowNegativeBalance: movementQuantityBefore < 0 ||
+                            movementQuantityBefore + retItem.quantity < 0,
+                        notes: "Damaged returned goods received and written off",
+                        createdBy: admin.id,
+                    });
+                    await InventoryService.recordMovement(queryRunner.manager, {
+                        productId: product.id,
+                        movementType: "damaged",
+                        quantityChange: -retItem.quantity,
+                        quantityBefore: movementQuantityBefore + retItem.quantity,
+                        locationId: movementLocationId,
+                        unitCost: movementUnitCost,
+                        valueChangeCents: -itemCogsCents,
+                        referenceType: "return",
+                        referenceId: returnReq.id,
+                        notes: "Damaged returned goods written off",
+                        allowNegativeBalance: movementQuantityBefore < 0,
+                        createdBy: admin.id,
+                    });
                     await AccountingService.recordInventoryAdjustment(
                         queryRunner.manager, 
                         returnReq.id, // using request ID as correlation
@@ -530,45 +696,44 @@ export class ReturnController {
                 await queryRunner.manager.save(retItem);
             }
 
-            const previousReturnedSubtotalCents = previousApprovedReturnItems.reduce(
-                (sum, item) => sum + Math.round(Number(item.sale_item.unit_price) * 100) * item.quantity,
-                0,
-            );
-            const previousReturnedTaxWeight = previousApprovedReturnItems.reduce(
-                (sum, item) => sum +
-                    Number(item.sale_item.unit_price) * item.quantity * Number(item.sale_item.tax_rate) / 100,
-                0,
-            );
-            const saleItems = await queryRunner.manager.find(SaleItem, {
-                where: { sale: { id: sale.id } },
-            });
-            const totalSaleTaxWeight = saleItems.reduce(
-                (sum, item) =>
-                    sum + Number(item.unit_price) * item.quantity * Number(item.tax_rate) / 100,
-                0,
-            );
-            const saleSubtotalCents = Math.round(Number(sale.subtotal) * 100);
-            const loyaltyDiscountCents = Math.round(Number(sale.loyalty_discount || 0) * 100);
-            const allocatedDiscountBeforeCents = saleSubtotalCents > 0
-                ? Math.round(loyaltyDiscountCents * previousReturnedSubtotalCents / saleSubtotalCents)
-                : 0;
-            const allocatedDiscountAfterCents = saleSubtotalCents > 0
-                ? Math.round(loyaltyDiscountCents *
-                    (previousReturnedSubtotalCents + grossSubtotalRefundCents) / saleSubtotalCents)
-                : 0;
-            const totalSubtotalRefund = (
-                grossSubtotalRefundCents - (allocatedDiscountAfterCents - allocatedDiscountBeforeCents)
-            ) / 100;
-            const saleTaxCents = Math.round(Number(sale.tax_amount) * 100);
-            const allocatedTaxBeforeCents = totalSaleTaxWeight > 0
-                ? Math.round(saleTaxCents * previousReturnedTaxWeight / totalSaleTaxWeight)
-                : 0;
-            const allocatedTaxAfterCents = totalSaleTaxWeight > 0
-                ? Math.round(saleTaxCents *
-                    (previousReturnedTaxWeight + currentReturnedTaxWeight) / totalSaleTaxWeight)
-                : 0;
-            const totalTaxRefund = (allocatedTaxAfterCents - allocatedTaxBeforeCents) / 100;
-            const totalRefundAmount = Number((totalSubtotalRefund + totalTaxRefund).toFixed(2));
+            const totalSubtotalRefund = Number(centsToKesString(subtotalRefundCents));
+            const totalTaxRefund = Number(centsToKesString(taxRefundCents));
+            const totalRefundCents = subtotalRefundCents + taxRefundCents;
+            const totalRefundAmount = Number(centsToKesString(totalRefundCents));
+
+            if (sale.voucher_id) {
+                const saleTotalCents = parseKesToCents(String(sale.total_amount));
+                const earnedPoints = BigInt(sale.voucher_points_earned || "0");
+                const redeemedPoints = BigInt(sale.voucher_points_redeemed || "0");
+                const reverseProportionally = (points: bigint) => saleTotalCents > 0n
+                    ? points * (previousRefundCents + totalRefundCents) / saleTotalCents -
+                        points * previousRefundCents / saleTotalCents
+                    : 0n;
+                const earnedToReverse = reverseProportionally(earnedPoints);
+                const redeemedToRestore = reverseProportionally(redeemedPoints);
+                if (earnedToReverse > 0n) {
+                    await VoucherService.append(queryRunner.manager, {
+                        voucherId: sale.voucher_id,
+                        type: "reversal",
+                        points: -earnedToReverse,
+                        actorId: admin.id,
+                        saleId: sale.id,
+                        reference: `return ${returnReq.id}: earned points`,
+                        reason: returnReq.reason,
+                    });
+                }
+                if (redeemedToRestore > 0n) {
+                    await VoucherService.append(queryRunner.manager, {
+                        voucherId: sale.voucher_id,
+                        type: "reversal",
+                        points: redeemedToRestore,
+                        actorId: admin.id,
+                        saleId: sale.id,
+                        reference: `return ${returnReq.id}: redeemed points`,
+                        reason: returnReq.reason,
+                    });
+                }
+            }
 
             sale.status = SaleStatus.PARTIALLY_REFUNDED;
             await queryRunner.manager.save(sale);
@@ -599,7 +764,7 @@ export class ReturnController {
             };
             if (returnReq.refund_method === RefundMethod.MPESA) {
                 returnReq.mpesa_refund_status = MpesaRefundStatus.PENDING;
-                returnReq.mpesa_refund_amount = Number(totalRefundAmount.toFixed(2));
+                returnReq.mpesa_refund_amount = Number(centsToKesString(totalRefundCents));
                 returnReq.pesapal_refund_logged = false;
                 returnReq.pesapal_refund_notes = "Awaiting confirmation of the Safaricom M-Pesa payout";
             }
@@ -614,7 +779,9 @@ export class ReturnController {
             );
 
             if (cashRefundShift) {
-                cashRefundShift.expected_cash = Number(cashRefundShift.expected_cash) - totalRefundAmount;
+                cashRefundShift.expected_cash = centsToKesString(
+                    parseKesDecimalToCents(String(cashRefundShift.expected_cash)) - totalRefundCents,
+                );
                 await queryRunner.manager.save(cashRefundShift);
             }
 
@@ -720,11 +887,12 @@ export class ReturnController {
                 return res.status(409).json({ message: "M-Pesa refund is not awaiting payout confirmation" });
             }
 
-            const amount = Number(returnReq.mpesa_refund_amount);
-            if (!Number.isFinite(amount) || amount <= 0) {
+            const amountCents = parseKesDecimalToCents(String(returnReq.mpesa_refund_amount));
+            if (amountCents <= 0n) {
                 await queryRunner.rollbackTransaction();
                 return res.status(409).json({ message: "M-Pesa refund amount is missing; reconcile this return before settlement" });
             }
+            const amount = Number(centsToKesString(amountCents));
 
             const confirmingUser = await queryRunner.manager.findOneBy(User, { id: req.user!.id });
             if (!confirmingUser) {
@@ -749,7 +917,9 @@ export class ReturnController {
             returnReq.pesapal_refund_notes = `Safaricom payout confirmed with receipt ${receiptNumber}`;
             await queryRunner.manager.save(returnReq);
 
-            activeShift.mpesa_total = Number(activeShift.mpesa_total) - amount;
+            activeShift.mpesa_total = centsToKesString(
+                parseKesDecimalToCents(String(activeShift.mpesa_total)) - amountCents,
+            );
             await queryRunner.manager.save(activeShift);
             await queryRunner.commitTransaction();
 

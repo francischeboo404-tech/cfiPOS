@@ -73,10 +73,13 @@ jobs:
       - name: Frontend Typecheck
         run: npx tsc --noEmit -p tsconfig.app.json
 
+      - name: Vercel Configuration Tests
+        run: node --test scripts/verify-vercel-env.test.mjs
+
       - name: Frontend Lint
         run: npx eslint .
 
       - name: Frontend Production Build
         env:
-          VITE_API_URL: /api
-        run: npm run build
+          VITE_API_URL: https://pos-api.example.com/api
+        run: npm run build:vercel

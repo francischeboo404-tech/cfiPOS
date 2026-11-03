@@ -13,6 +13,7 @@ import {
 } from "@/components/ui/table";
 import { Badge } from "@/components/ui/badge";
 import { toast } from "sonner";
+import { formatKesCents, parseKesToCents } from "@/lib/exactMoney";
 import {
   Award,
   Gift,
@@ -28,13 +29,21 @@ interface LoyaltyMember {
   customer_id: string;
   points: number;
   tier: string;
-  total_spent: number;
+  total_spent: number | string;
   created_at: string;
+  customer?: {
+    name: string;
+    phone: string;
+  };
   customers?: {
     name: string;
     phone: string;
   };
 }
+
+type LoyaltyMemberResponse = Omit<LoyaltyMember, "points"> & {
+  points: number | string;
+};
 
 interface LoyaltyTier {
   name: string;
@@ -117,10 +126,23 @@ export default function Loyalty() {
 
   const loadLoyaltyMembers = async () => {
     try {
-      const data = await ApiService.get<LoyaltyMember[]>("/loyalty/members");
-      setMembers(data || []);
+      const data = await ApiService.get<LoyaltyMemberResponse[]>("/loyalty/members");
+      if (!Array.isArray(data)) {
+        throw new Error("The server returned an invalid loyalty customer list");
+      }
+      setMembers(
+        data.map((member) => ({
+          ...member,
+          points: Number(member.points),
+          customer: member.customer ?? member.customers,
+        })),
+      );
     } catch (error) {
-      toast.error(error.message || "Error loading loyalty members");
+      toast.error(
+        error instanceof Error
+          ? error.message
+          : "Error loading loyalty customers",
+      );
     } finally {
       setLoading(false);
     }
@@ -169,9 +191,15 @@ export default function Loyalty() {
     (customer) => !members.some((member) => member.customer_id === customer.id),
   );
 
-  const calculateTier = (totalSpent: number) => {
+  const calculateTier = (totalSpent: number | string) => {
+    const totalSpentCents = BigInt(
+      parseKesToCents(String(totalSpent)),
+    );
     for (let i = tiers.length - 1; i >= 0; i--) {
-      if (totalSpent >= tiers[i].min) {
+      if (
+        totalSpentCents >=
+        BigInt(parseKesToCents(String(tiers[i].min)))
+      ) {
         return tiers[i];
       }
     }
@@ -217,15 +245,22 @@ export default function Loyalty() {
   };
 
   const filteredMembers = members.filter(
-    (member) =>
-      member.customers?.name.toLowerCase().includes(searchTerm.toLowerCase()) ||
-      member.customers?.phone.includes(searchTerm),
+    (member) => {
+      const name = member.customer?.name || "";
+      const phone = member.customer?.phone || "";
+      const query = searchTerm.trim().toLowerCase();
+      return name.toLowerCase().includes(query) || phone.toLowerCase().includes(query);
+    },
   );
 
   const stats = {
     totalMembers: members.length,
     totalPoints: members.reduce((sum, m) => sum + m.points, 0),
-    totalSpent: members.reduce((sum, m) => sum + m.total_spent, 0),
+    totalSpentCents: members.reduce(
+      (sum, member) =>
+        sum + BigInt(parseKesToCents(String(member.total_spent))),
+      0n,
+    ),
     avgPoints:
       members.length > 0
         ? Math.round(
@@ -293,7 +328,7 @@ export default function Loyalty() {
           <CardContent className="p-6">
             <div className="flex items-center justify-between">
               <div>
-                <p className="text-sm text-muted-foreground">Total Members</p>
+                <p className="text-sm text-muted-foreground">Loyalty Customers</p>
                 <p className="text-2xl font-bold">{stats.totalMembers}</p>
               </div>
               <Users className="h-8 w-8 text-primary" />
@@ -319,11 +354,7 @@ export default function Loyalty() {
               <div>
                 <p className="text-sm text-muted-foreground">Total Spent</p>
                 <p className="text-2xl font-bold">
-                  {stats.totalSpent.toLocaleString("en-KE", {
-                    style: "currency",
-                    currency: "KES",
-                    maximumFractionDigits: 0,
-                  })}
+                  {formatKesCents(stats.totalSpentCents)}
                 </p>
               </div>
               <TrendingUp className="h-8 w-8 text-primary" />
@@ -360,7 +391,7 @@ export default function Loyalty() {
                   <h3 className="font-semibold">{tier.name}</h3>
                 </div>
                 <p className="text-sm text-muted-foreground mb-1">
-                  Min. Spend: KSh {tier.min.toLocaleString()}
+                  Min. Spend: {formatKesCents(parseKesToCents(String(tier.min)))}
                 </p>
                 <p className="text-sm font-medium">
                   {tier.pointsMultiplier}x Points
@@ -375,11 +406,11 @@ export default function Loyalty() {
       <Card>
         <CardHeader>
           <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4">
-            <CardTitle>Loyalty Members</CardTitle>
+            <CardTitle>Loyalty Customers</CardTitle>
             <div className="relative w-full sm:w-64">
               <Search className="absolute left-3 top-1/2 transform -translate-y-1/2 h-4 w-4 text-muted-foreground" />
               <Input
-                placeholder="Search members..."
+                placeholder="Search loyalty customers..."
                 value={searchTerm}
                 onChange={(e) => setSearchTerm(e.target.value)}
                 className="pl-9"
@@ -406,7 +437,7 @@ export default function Loyalty() {
                 {loading ? (
                   <TableRow>
                     <TableCell colSpan={6} className="text-center py-8">
-                      Loading members...
+                      Loading loyalty customers...
                     </TableCell>
                   </TableRow>
                 ) : filteredMembers.length === 0 ? (
@@ -415,8 +446,8 @@ export default function Loyalty() {
                       colSpan={6}
                       className="text-center py-8 text-muted-foreground"
                     >
-                      No loyalty members found. Members are added automatically
-                      when customers make purchases.
+                      No loyalty customers found. Enroll a customer or record a
+                      qualifying purchase to add them to the program.
                     </TableCell>
                   </TableRow>
                 ) : (
@@ -425,19 +456,18 @@ export default function Loyalty() {
                     return (
                       <TableRow key={member.id}>
                         <TableCell className="font-medium">
-                          {member.customers?.name || "Unknown"}
+                          {member.customer?.name || "Unknown"}
                         </TableCell>
                         <TableCell className="hidden sm:table-cell">
-                          {member.customers?.phone}
+                          {member.customer?.phone}
                         </TableCell>
                         <TableCell className="font-semibold text-primary">
                           {member.points.toLocaleString()} pts
                         </TableCell>
                         <TableCell className="hidden md:table-cell">
-                          KSh{" "}
-                          {member.total_spent.toLocaleString("en-KE", {
-                            minimumFractionDigits: 2,
-                          })}
+                          {formatKesCents(
+                            parseKesToCents(String(member.total_spent)),
+                          )}
                         </TableCell>
                         <TableCell>
                           <Badge className={tier.color}>{tier.name}</Badge>

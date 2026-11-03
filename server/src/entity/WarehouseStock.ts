@@ -33,6 +33,9 @@ export class WarehouseStock {
     @Column("int", { default: 0 })
     stock_on_hand: number;
 
+    @Column("bigint", { nullable: true })
+    stock_value_cents: string | null;
+
     @UpdateDateColumn()
     updated_at: Date;
 }

@@ -133,6 +133,25 @@ test("validateSystemConfig passes when valid production configuration is supplie
     assert.equal(result.errors.length, 0);
 });
 
+test("validateSystemConfig rejects live eTIMS until the VSCU integration is verified", () => {
+    const liveEnv: NodeJS.ProcessEnv = {
+        NODE_ENV: "production",
+        PORT: "3000",
+        DATABASE_URL: "postgresql://127.0.0.1:5432/pos_db",
+        JWT_SECRET: "a".repeat(64),
+        ENCRYPTION_KEY: "b".repeat(64),
+        CORS_ORIGINS: "https://pos.example.co.ke",
+        ETIMS_MODE: "live",
+        RESEND_API_KEY: "re_valid_key_12345",
+        RESEND_FROM_EMAIL: "CFI POS <billing@example.co.ke>",
+        ENABLE_MPESA: "false",
+    };
+
+    const result = validateSystemConfig("production", liveEnv);
+    assert.equal(result.valid, false);
+    assert.ok(result.errors.some((error) => error.includes("ETIMS_MODE=live is disabled")));
+});
+
 test("Pesapal payments are blocked when ENABLE_PESAPAL_PAYMENTS is false", async () => {
     const origFlag = process.env.ENABLE_PESAPAL_PAYMENTS;
     const origEnv = process.env.NODE_ENV;

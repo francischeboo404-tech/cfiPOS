@@ -3,6 +3,7 @@ import { ApiService } from "@/lib/api";
 import { Card, CardContent } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Star, Award, TrendingUp } from "lucide-react";
+import { formatKesCents, parseKesToCents } from "@/lib/exactMoney";
 
 interface LoyaltyPointsDisplayProps {
   customerId: string;
@@ -13,7 +14,7 @@ interface LoyaltyPointsDisplayProps {
 interface LoyaltyMember {
   points: number;
   tier: string;
-  total_spent: number;
+  total_spent: number | string;
 }
 
 interface CustomerInfo {
@@ -39,7 +40,7 @@ export function LoyaltyPointsDisplay({
             customer_id: string;
             points: number;
             tier: string;
-            total_spent: number;
+            total_spent: number | string;
             customer?: { id: string; name: string; phone: string };
           }>
         >("/loyalty/members"),
@@ -53,7 +54,7 @@ export function LoyaltyPointsDisplay({
         setMember({
           points: Number(memberData.points || 0),
           tier: memberData.tier || "Bronze",
-          total_spent: Number(memberData.total_spent || 0),
+          total_spent: memberData.total_spent ?? 0,
         });
 
         if (memberData.customer) {
@@ -90,20 +91,28 @@ export function LoyaltyPointsDisplay({
   };
 
   const getNextTier = () => {
-    const tierSilverMin = parseFloat(settings.loyalty_tier_silver_min) || 50000;
-    const tierGoldMin = parseFloat(settings.loyalty_tier_gold_min) || 150000;
-    const tierPlatinumMin =
-      parseFloat(settings.loyalty_tier_platinum_min) || 300000;
+    const tierSilverMin = BigInt(
+      parseKesToCents(settings.loyalty_tier_silver_min || "50000"),
+    ) || 5000000n;
+    const tierGoldMin = BigInt(
+      parseKesToCents(settings.loyalty_tier_gold_min || "150000"),
+    ) || 15000000n;
+    const tierPlatinumMin = BigInt(
+      parseKesToCents(settings.loyalty_tier_platinum_min || "300000"),
+    ) || 30000000n;
+    const totalSpentCents = BigInt(
+      parseKesToCents(String(member.total_spent)),
+    );
 
     if (member.tier === "Bronze") {
-      const remaining = tierSilverMin - member.total_spent;
-      return remaining > 0 ? { tier: "Silver", remaining } : null;
+      const remaining = tierSilverMin - totalSpentCents;
+      return remaining > 0n ? { tier: "Silver", remaining } : null;
     } else if (member.tier === "Silver") {
-      const remaining = tierGoldMin - member.total_spent;
-      return remaining > 0 ? { tier: "Gold", remaining } : null;
+      const remaining = tierGoldMin - totalSpentCents;
+      return remaining > 0n ? { tier: "Gold", remaining } : null;
     } else if (member.tier === "Gold") {
-      const remaining = tierPlatinumMin - member.total_spent;
-      return remaining > 0 ? { tier: "Platinum", remaining } : null;
+      const remaining = tierPlatinumMin - totalSpentCents;
+      return remaining > 0n ? { tier: "Platinum", remaining } : null;
     }
     return null;
   };
@@ -161,7 +170,7 @@ export function LoyaltyPointsDisplay({
         <div className="flex justify-between text-sm">
           <span className="text-muted-foreground">Total Spent:</span>
           <span className="font-semibold">
-            KSh {member.total_spent.toLocaleString("en-KE")}
+            {formatKesCents(parseKesToCents(String(member.total_spent)))}
           </span>
         </div>
 
@@ -170,7 +179,7 @@ export function LoyaltyPointsDisplay({
           <div className="text-xs text-center text-muted-foreground bg-muted/30 p-2 rounded">
             Spend{" "}
             <span className="font-bold text-primary">
-              KSh {nextTier.remaining.toLocaleString("en-KE")}
+              {formatKesCents(nextTier.remaining)}
             </span>{" "}
             more to reach <span className="font-bold">{nextTier.tier}</span>{" "}
             tier!

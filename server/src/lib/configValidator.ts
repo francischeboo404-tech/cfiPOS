@@ -1,5 +1,6 @@
 import { KNOWN_DEFAULT_ENCRYPTION_KEYS, KNOWN_DEFAULT_JWT_SECRETS } from "../data-source";
 import { getOtpEmailConfigurationIssues } from "../services/EmailService";
+import { ETIMS_LIVE_MODE_AVAILABLE } from "../services/etims/EtimsProvider";
 
 export interface ConfigValidationResult {
     valid: boolean;
@@ -76,6 +77,8 @@ export function validateSystemConfig(
     if (isProduction) {
         if (!etimsMode || !["off", "mock", "live"].includes(etimsMode)) {
             errors.push("ETIMS_MODE must be explicitly set to 'off', 'mock', or 'live' in production.");
+        } else if (etimsMode === "live" && !ETIMS_LIVE_MODE_AVAILABLE) {
+            errors.push("ETIMS_MODE=live is disabled until the KRA VSCU integration is implemented and verified.");
         }
     }
 

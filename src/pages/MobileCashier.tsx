@@ -1,5 +1,5 @@
 import { useCallback, useState, useEffect, useRef } from "react";
-import { ApiService } from "@/lib/api";
+import { ApiRequestError, ApiService } from "@/lib/api";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
@@ -16,11 +16,23 @@ import {
   Loader2,
 } from "lucide-react";
 import { BarcodeScanner } from "@/components/BarcodeScanner";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
+import {
+  centsToKesString,
+  formatKesCents,
+  parseKesToCents,
+} from "@/lib/exactMoney";
 
 interface Product {
   id: string;
   name: string;
-  retail_price: number;
+  retail_price: number | string;
   tax_rate?: number;
   tax_class?: { rate: number } | null;
   stock_on_hand: number;
@@ -32,15 +44,34 @@ interface CartItem {
   quantity: number;
 }
 
+interface Warehouse {
+  id: string;
+  name: string;
+  is_main?: boolean;
+}
+
+interface PricingPreview {
+  cartSignature: string;
+  checkoutSessionId: string;
+  totalCents: string | null;
+}
+
 export default function MobileCashier() {
   const { user } = useAuth();
   const [products, setProducts] = useState<Product[]>([]);
+  const [warehouses, setWarehouses] = useState<Warehouse[]>([]);
   const [cart, setCart] = useState<CartItem[]>([]);
   const [searchTerm, setSearchTerm] = useState("");
   const [showScanner, setShowScanner] = useState(false);
   const [activeShift, setActiveShift] = useState<string | null>(null);
+  const [selectedWarehouse, setSelectedWarehouse] = useState("");
+  const [warehousesLoading, setWarehousesLoading] = useState(true);
+  const [productsLoading, setProductsLoading] = useState(false);
   const [checkingOut, setCheckingOut] = useState(false);
   const checkoutInProgress = useRef(false);
+  const pricingPreviewRef = useRef<PricingPreview | null>(null);
+  const [pricingPreview, setPricingPreview] = useState<PricingPreview | null>(null);
+  const productLoadSequence = useRef(0);
   const checkoutKey = useRef<{ cartSignature: string; key: string } | null>(
     null,
   );
@@ -57,28 +88,141 @@ export default function MobileCashier() {
     }
   }, [user]);
 
-  const loadProducts = useCallback(async () => {
+  const loadWarehouses = useCallback(async () => {
     try {
-      const response = await ApiService.get<Product[]>("/products");
+      const response = await ApiService.get<Warehouse[]>("/warehouses");
+      const activeWarehouses = Array.isArray(response)
+        ? response.filter((warehouse) => warehouse.id && warehouse.name)
+        : [];
+      setWarehouses(activeWarehouses);
+
+      let savedWarehouseId = "";
+      if (user?.id) {
+        try {
+          const saved = localStorage.getItem(`pos:last-warehouse:${user.id}`);
+          savedWarehouseId = saved
+            ? (JSON.parse(saved) as { id?: string }).id || ""
+            : "";
+        } catch (error) {
+          console.error("Unable to restore the saved POS location:", error);
+        }
+      }
+      const preferredWarehouse = activeWarehouses.find(
+        (warehouse) => warehouse.id === savedWarehouseId,
+      );
+      const defaultWarehouse =
+        activeWarehouses.find((warehouse) => warehouse.is_main) ??
+        activeWarehouses[0];
+      setSelectedWarehouse(
+        preferredWarehouse?.id ?? defaultWarehouse?.id ?? "",
+      );
+    } catch (error) {
+      setWarehouses([]);
+      setSelectedWarehouse("");
+      toast.error(
+        error instanceof Error
+          ? `Unable to load warehouses: ${error.message}`
+          : "Unable to load warehouses",
+      );
+    } finally {
+      setWarehousesLoading(false);
+    }
+  }, [user?.id]);
+
+  const loadProducts = useCallback(async (warehouseId: string) => {
+    const loadSequence = ++productLoadSequence.current;
+    if (!warehouseId) {
+      setProducts([]);
+      setProductsLoading(false);
+      return;
+    }
+
+    setProductsLoading(true);
+    try {
+      const response = await ApiService.get<Product[]>(
+        `/products?warehouse_id=${encodeURIComponent(warehouseId)}`,
+      );
+      if (loadSequence !== productLoadSequence.current) return;
       setProducts(
         (response || []).filter((product) => Number(product.stock_on_hand) > 0),
       );
     } catch (error) {
+      if (loadSequence !== productLoadSequence.current) return;
       setProducts([]);
-      toast.error("Unable to load products");
+      toast.error(
+        error instanceof Error
+          ? `Unable to load products: ${error.message}`
+          : "Unable to load products",
+      );
+    } finally {
+      if (loadSequence === productLoadSequence.current) {
+        setProductsLoading(false);
+      }
     }
   }, []);
 
   useEffect(() => {
-    void loadProducts();
+    void loadWarehouses();
     void checkActiveShift();
-  }, [checkActiveShift, loadProducts]);
+  }, [checkActiveShift, loadWarehouses]);
+
+  useEffect(() => {
+    void loadProducts(selectedWarehouse);
+  }, [loadProducts, selectedWarehouse]);
+
+  useEffect(() => {
+    if (!user?.id || !selectedWarehouse) return;
+    const warehouse = warehouses.find(
+      (entry) => entry.id === selectedWarehouse,
+    );
+    if (!warehouse) return;
+    try {
+      localStorage.setItem(
+        `pos:last-warehouse:${user.id}`,
+        JSON.stringify(warehouse),
+      );
+    } catch (error) {
+      console.error("Unable to save the selected POS location:", error);
+    }
+  }, [selectedWarehouse, user?.id, warehouses]);
 
   const filteredProducts = products.filter(
     (p) =>
       p.name.toLowerCase().includes(searchTerm.toLowerCase()) ||
       p.barcode?.includes(searchTerm),
   );
+
+  const getCartSignature = (
+    items: CartItem[] = cart,
+    warehouseId: string = selectedWarehouse,
+  ) =>
+    JSON.stringify({
+      warehouse_id: warehouseId,
+      items: items.map((item) => ({
+        product_id: item.product.id,
+        quantity: item.quantity,
+      })),
+    });
+
+  const releasePricingPreview = () => {
+    const preview = pricingPreviewRef.current;
+    pricingPreviewRef.current = null;
+    setPricingPreview(null);
+    if (!preview?.checkoutSessionId) return;
+
+    void ApiService.post(
+      `/sales/checkouts/${encodeURIComponent(preview.checkoutSessionId)}/cancel`,
+      {},
+    ).catch((error) => {
+      if (error instanceof ApiRequestError && error.status === 404) return;
+      console.error("Unable to release the mobile checkout reservation:", error);
+      toast.error(
+        error instanceof Error
+          ? `Unable to release the checkout reservation: ${error.message}`
+          : "Unable to release the checkout reservation",
+      );
+    });
+  };
 
   const handleBarcodeDetected = (barcode: string) => {
     const product = products.find((p) => p.barcode === barcode);
@@ -100,6 +244,7 @@ export default function MobileCashier() {
         return;
       }
       checkoutKey.current = null;
+      releasePricingPreview();
       setCart(
         cart.map((item) =>
           item.product.id === product.id
@@ -109,20 +254,23 @@ export default function MobileCashier() {
       );
     } else {
       checkoutKey.current = null;
+      releasePricingPreview();
       setCart([...cart, { product, quantity: 1 }]);
     }
   };
 
   const updateQuantity = (productId: string, change: number) => {
     if (checkoutInProgress.current) return;
+    const currentItem = cart.find((item) => item.product.id === productId);
+    if (!currentItem) return;
+    const nextQuantity = currentItem.quantity + change;
+    if (nextQuantity <= 0 || nextQuantity > currentItem.product.stock_on_hand) return;
+    checkoutKey.current = null;
+    releasePricingPreview();
     setCart(
       cart.map((item) => {
         if (item.product.id === productId) {
           const newQuantity = item.quantity + change;
-          if (newQuantity <= 0 || newQuantity > item.product.stock_on_hand) {
-            return item;
-          }
-          checkoutKey.current = null;
           return { ...item, quantity: newQuantity };
         }
         return item;
@@ -134,23 +282,40 @@ export default function MobileCashier() {
     if (checkoutInProgress.current) return;
     if (!cart.some((item) => item.product.id === productId)) return;
     checkoutKey.current = null;
+    releasePricingPreview();
     setCart(cart.filter((item) => item.product.id !== productId));
   };
 
-  const getTotal = () => {
-    return cart.reduce((sum, item) => {
-      const taxRate = Number(
-        item.product.tax_class?.rate ?? item.product.tax_rate ?? 0,
-      );
-      const subtotal = Number(item.product.retail_price) * item.quantity;
-      return sum + subtotal + (subtotal * taxRate) / 100;
-    }, 0);
+  const handleWarehouseChange = (warehouseId: string) => {
+    if (warehouseId === selectedWarehouse) return;
+    if (cart.length > 0) {
+      setCart([]);
+      checkoutKey.current = null;
+      releasePricingPreview();
+      toast.info("Cart cleared because the sales branch changed.");
+    }
+    setSelectedWarehouse(warehouseId);
+  };
+
+  const getTotalCents = () => {
+    return cart.reduce(
+      (sum, item) =>
+        sum +
+        BigInt(parseKesToCents(String(item.product.retail_price))) *
+          BigInt(item.quantity),
+      0n,
+    );
   };
 
   const handleCheckout = async () => {
     if (checkoutInProgress.current) return;
     if (cart.length === 0) {
       toast.error("Cart is empty");
+      return;
+    }
+
+    if (!selectedWarehouse) {
+      toast.error("Select an active branch before selling.");
       return;
     }
 
@@ -163,7 +328,7 @@ export default function MobileCashier() {
       product_id: item.product.id,
       quantity: item.quantity,
     }));
-    const cartSignature = JSON.stringify(saleItems);
+    const cartSignature = getCartSignature(cart, selectedWarehouse);
     if (checkoutKey.current?.cartSignature !== cartSignature) {
       checkoutKey.current = { cartSignature, key: crypto.randomUUID() };
     }
@@ -172,17 +337,68 @@ export default function MobileCashier() {
     checkoutInProgress.current = true;
     setCheckingOut(true);
     try {
+      let preview = pricingPreviewRef.current;
+      if (!preview || preview.cartSignature !== cartSignature) {
+        if (preview) releasePricingPreview();
+        preview = {
+          cartSignature,
+          checkoutSessionId: crypto.randomUUID(),
+          totalCents: null,
+        };
+        pricingPreviewRef.current = preview;
+        setPricingPreview(preview);
+      }
+
+      if (preview.totalCents === null) {
+        const reservedCheckout = await ApiService.post<{
+          id: string;
+          total_amount: number | string;
+        }>("/sales/checkouts", {
+          checkout_session_id: preview.checkoutSessionId,
+          items: saleItems,
+          warehouse_id: selectedWarehouse,
+          cash_amount: 0,
+          store_credit_amount: 0,
+        });
+        preview = {
+          ...preview,
+          totalCents: String(parseKesToCents(String(reservedCheckout.total_amount))),
+        };
+        pricingPreviewRef.current = preview;
+        setPricingPreview(preview);
+        toast.success("Exact total ready. Confirm the cash sale to continue.");
+        return;
+      }
+
+      const totalCents = BigInt(preview.totalCents);
+      const confirmedCheckout = await ApiService.post<{
+        cash_amount: number | string;
+      }>(
+        `/sales/checkouts/${encodeURIComponent(preview.checkoutSessionId)}/confirm-cash`,
+        {},
+      );
+      if (
+        BigInt(parseKesToCents(String(confirmedCheckout.cash_amount))) !==
+        totalCents
+      ) {
+        throw new Error("The confirmed cash amount did not match the server total.");
+      }
+
       await ApiService.post("/sales", {
         items: saleItems,
+        warehouse_id: selectedWarehouse,
         payment_method: "cash",
-        cash_amount: getTotal(),
+        cash_amount: centsToKesString(totalCents),
+        checkout_session_id: preview.checkoutSessionId,
         idempotency_key: idempotencyKey,
       });
 
       toast.success("Sale completed!");
       checkoutKey.current = null;
+      pricingPreviewRef.current = null;
+      setPricingPreview(null);
       setCart([]);
-      loadProducts();
+      loadProducts(selectedWarehouse);
     } catch (error) {
       toast.error(
         error instanceof Error ? error.message : "Unable to complete the sale",
@@ -193,12 +409,55 @@ export default function MobileCashier() {
     }
   };
 
+  const activePricingPreview =
+    pricingPreview?.cartSignature === getCartSignature() ? pricingPreview : null;
+  const displayedTotalCents =
+    activePricingPreview?.totalCents !== null &&
+    activePricingPreview?.totalCents !== undefined
+      ? BigInt(activePricingPreview.totalCents)
+      : getTotalCents();
+
   return (
     <div className="min-h-screen bg-background p-4 pb-24">
       {/* Header */}
       <div className="mb-6">
         <h1 className="text-3xl font-bold mb-2">Quick Sale</h1>
         <p className="text-muted-foreground">Tap products to add to cart</p>
+      </div>
+
+      <div className="mb-6 space-y-2">
+        <label className="text-sm font-medium" htmlFor="mobile-cashier-warehouse">
+          Sales branch
+        </label>
+        <Select
+          value={selectedWarehouse}
+          onValueChange={handleWarehouseChange}
+          disabled={warehousesLoading || warehouses.length === 0 || checkingOut}
+        >
+          <SelectTrigger
+            id="mobile-cashier-warehouse"
+            className="h-12 text-base"
+          >
+            <SelectValue
+              placeholder={
+                warehousesLoading ? "Loading branches..." : "Select branch"
+              }
+            />
+          </SelectTrigger>
+          <SelectContent>
+            {warehouses.map((warehouse) => (
+              <SelectItem key={warehouse.id} value={warehouse.id}>
+                {warehouse.name}
+              </SelectItem>
+            ))}
+          </SelectContent>
+        </Select>
+        {!warehousesLoading && warehouses.length === 0 && (
+          <p className="text-sm text-destructive">
+            No active branch is available. Contact an administrator before
+            making a sale.
+          </p>
+        )}
       </div>
 
       {/* Search and Scanner */}
@@ -226,6 +485,11 @@ export default function MobileCashier() {
       )}
 
       {/* Product Grid */}
+      {productsLoading && (
+        <p className="mb-4 text-sm text-muted-foreground">
+          Loading branch stock...
+        </p>
+      )}
       <div className="grid grid-cols-2 gap-4 mb-6">
         {filteredProducts.slice(0, 20).map((product) => (
           <Card
@@ -239,7 +503,7 @@ export default function MobileCashier() {
               </h3>
               <div className="space-y-2">
                 <p className="text-2xl font-bold text-primary">
-                  KSh {product.retail_price.toLocaleString("en-KE")}
+                  {formatKesCents(parseKesToCents(String(product.retail_price)))}
                 </p>
                 <Badge
                   variant={
@@ -266,7 +530,7 @@ export default function MobileCashier() {
                 <div className="flex-1">
                   <p className="font-semibold">{item.product.name}</p>
                   <p className="text-sm text-muted-foreground">
-                    KSh {item.product.retail_price.toLocaleString("en-KE")} ×{" "}
+                    {formatKesCents(parseKesToCents(String(item.product.retail_price)))} ×{" "}
                     {item.quantity}
                   </p>
                 </div>
@@ -308,17 +572,19 @@ export default function MobileCashier() {
 
           <div className="p-4 bg-primary text-primary-foreground">
             <div className="flex justify-between items-center mb-3">
-              <span className="text-lg">Total:</span>
+              <span className="text-lg">
+                {activePricingPreview?.totalCents === null ||
+                !activePricingPreview
+                  ? "Estimated total:"
+                  : "Total:"}
+              </span>
               <span className="text-3xl font-bold">
-                KSh{" "}
-                {getTotal().toLocaleString("en-KE", {
-                  minimumFractionDigits: 2,
-                })}
+                {formatKesCents(displayedTotalCents)}
               </span>
             </div>
             <Button
               onClick={handleCheckout}
-              disabled={checkingOut}
+              disabled={checkingOut || !selectedWarehouse}
               className="w-full h-14 text-lg bg-background text-foreground hover:bg-background/90"
             >
               {checkingOut ? (
@@ -328,7 +594,10 @@ export default function MobileCashier() {
               )}
               {checkingOut
                 ? "Processing sale..."
-                : `Complete Sale (${cart.length} items)`}
+                : activePricingPreview?.totalCents !== null &&
+                    activePricingPreview
+                  ? `Confirm Cash Sale (${cart.length} items)`
+                  : `Review Exact Total (${cart.length} items)`}
             </Button>
           </div>
         </div>

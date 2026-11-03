@@ -39,6 +39,27 @@ export class Product {
     @Column({ default: "piece" })
     unit_of_measure: string;
 
+    @Column({ type: "varchar", length: 20, nullable: true })
+    etims_item_code: string | null;
+
+    @Column({ type: "varchar", length: 10, nullable: true })
+    etims_item_class_code: string | null;
+
+    @Column({ type: "varchar", length: 5, nullable: true })
+    etims_product_type_code: string | null;
+
+    @Column({ type: "varchar", length: 5, nullable: true })
+    etims_origin_country_code: string | null;
+
+    @Column({ type: "varchar", length: 5, nullable: true })
+    etims_packaging_unit_code: string | null;
+
+    @Column({ type: "varchar", length: 5, nullable: true })
+    etims_quantity_unit_code: string | null;
+
+    @Column({ type: "varchar", length: 5, nullable: true })
+    etims_tax_type_code: string | null;
+
     @Column("int", { default: 10 })
     reorder_level: number;
 

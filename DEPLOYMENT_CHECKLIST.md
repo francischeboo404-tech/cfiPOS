@@ -6,6 +6,7 @@
 - [ ] For a new deployment, provision a dedicated empty PostgreSQL database and run `npm run db:bootstrap` from `server` with `POS_DB_BOOTSTRAP_CONFIRM=CREATE_SCHEMA_IN_EMPTY_DATABASE`. It refuses non-empty public schemas and applies the TypeORM entity baseline plus all TypeORM migrations.
 - [ ] For an empty PostgreSQL deployment, keep the API out of service until bootstrap completes and `npm run migration:show` confirms no pending migrations.
 - [ ] For an existing deployment, confirm the supported baseline schema and take a verified backup. Never run the bootstrap command against an existing database.
+- [ ] Before migrations or recovery exercises, restore the selected archive with `scripts/restore-test.sh` using `RESTORE_TEST_DATABASE_URL` for a dedicated non-production PostgreSQL server; require a successful exit and cleanup confirmation.
 - [ ] From `server`, run `npm run migration:show` against the backend database and confirm which TypeORM migrations are pending.
 - [ ] Back up the backend database, review the pending migrations, then run `npm run migration:run`; run `npm run migration:show` again and confirm no pending migrations remain.
 - [ ] Do not run Supabase migrations or `database_migrations.sql` for this PostgreSQL-only deployment.
@@ -25,6 +26,8 @@
   - [ ] `RESEND_FROM_EMAIL` (sender verified in the configured Resend account)
   - [ ] `GEMINI_API_KEY` (if using AI features)
   - [ ] `ENCRYPTION_KEY` (64-character hex key, 32 bytes; not a `VITE_` variable)
+  - [ ] Keep `ETIMS_MODE=off` unless the business's approved fiscalization route has been implemented and verified; VSCU placeholders do not make live fiscalization ready.
+  - [ ] Do not configure VSCU PINs, device identifiers, or endpoints in frontend variables or source control; follow [ETIMS_INTEGRATION.md](./docs/ETIMS_INTEGRATION.md) and verify the API host can reach the authorized VSCU before configuring secrets.
 
 ### 3. Security Configuration
 - [ ] Verify CSP headers in `vite.config.ts`

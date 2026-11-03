@@ -22,6 +22,7 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { Switch } from "@/components/ui/switch";
+import { centsToKesString, parseKesToCents } from "@/lib/exactMoney";
 
 interface TaxClass {
   id: string;
@@ -82,6 +83,7 @@ export default function NewProduct() {
     retail_price: string;
     unit_cost: string;
     stock_on_hand: string;
+    etims_item_code: string;
   }>>([]);
 
   const [formData, setFormData] = useState({
@@ -96,7 +98,23 @@ export default function NewProduct() {
     category_id: "",
     unit_of_measure: "piece",
     location: "main",
+    etims_item_code: "",
+    etims_item_class_code: "",
+    etims_product_type_code: "",
+    etims_origin_country_code: "",
+    etims_packaging_unit_code: "",
+    etims_quantity_unit_code: "",
+    etims_tax_type_code: "",
   });
+
+  const getPriceCents = (value: string): number | null => {
+    try {
+      const cents = parseKesToCents(value);
+      return cents <= 9_999_999_999 ? cents : null;
+    } catch {
+      return null;
+    }
+  };
 
   useEffect(() => {
     void loadTaxClasses();
@@ -206,6 +224,7 @@ export default function NewProduct() {
         retail_price: formData.retail_price,
         unit_cost: formData.unit_cost,
         stock_on_hand: "0",
+        etims_item_code: "",
       };
     });
 
@@ -230,26 +249,20 @@ export default function NewProduct() {
       toast.error("Add at least one complete variant option before saving this product.");
       return;
     }
-    if (openingQuantities.some((quantity) => !Number.isInteger(quantity) || quantity < 0)) {
+    if (openingQuantities.some((quantity) => !Number.isSafeInteger(quantity) || quantity < 0)) {
       toast.error("Opening stock must be a non-negative whole number.");
       return;
     }
     const pricesAreValid = hasVariants
       ? generatedVariants.every((variant) =>
           variant.sku.trim() &&
-          variant.retail_price.trim() !== "" &&
-          Number.isFinite(Number(variant.retail_price)) &&
-          Number(variant.retail_price) >= 0 &&
-          variant.unit_cost.trim() !== "" &&
-          Number.isFinite(Number(variant.unit_cost)) &&
-          Number(variant.unit_cost) >= 0,
+          getPriceCents(variant.retail_price) !== null &&
+          getPriceCents(variant.unit_cost) !== null,
         )
-      : Number.isFinite(Number(formData.retail_price)) &&
-        Number(formData.retail_price) >= 0 &&
-        Number.isFinite(Number(formData.unit_cost)) &&
-        Number(formData.unit_cost) >= 0;
+      : getPriceCents(formData.retail_price) !== null &&
+        getPriceCents(formData.unit_cost) !== null;
     if (!pricesAreValid) {
-      toast.error("Enter a SKU, retail price, and unit cost of zero or more for every product and variant.");
+      toast.error("Enter a SKU and non-negative retail prices and unit costs with at most two decimal places (maximum KSh 99,999,999.99).");
       return;
     }
     const reorderLevel = Number(formData.reorder_level);
@@ -269,44 +282,60 @@ export default function NewProduct() {
         sku: string;
         barcode: string;
         category_id: string | null;
-        unit_cost: number;
-        retail_price: number;
+        unit_cost: string;
+        retail_price: string;
         stock_on_hand: number;
         reorder_level: number;
         tax_class_id: string | null;
         unit_of_measure: string;
         location: string;
+        etims_item_code?: string;
+        etims_item_class_code: string;
+        etims_product_type_code: string;
+        etims_origin_country_code: string;
+        etims_packaging_unit_code: string;
+        etims_quantity_unit_code: string;
+        etims_tax_type_code: string;
         warehouse_id?: string;
         variants?: Array<{
           sku: string;
           barcode: string;
           variant_attributes: Record<string, string>;
-          unit_cost: number;
-          retail_price: number;
+          unit_cost: string;
+          retail_price: string;
           stock_on_hand: number;
+          etims_item_code: string;
         }>;
       } = {
         name: formData.name,
         sku: formData.sku,
         barcode: formData.barcode || formData.sku,
         category_id: formData.category_id || null,
-        unit_cost: parseFloat(formData.unit_cost || "0"),
-        retail_price: parseFloat(formData.retail_price || "0"),
+        unit_cost: centsToKesString(getPriceCents(formData.unit_cost) ?? 0),
+        retail_price: centsToKesString(getPriceCents(formData.retail_price) ?? 0),
         stock_on_hand: Number(formData.stock_on_hand || "0"),
         reorder_level: reorderLevel,
         tax_class_id: formData.tax_class_id || null,
         unit_of_measure: formData.unit_of_measure,
         location: formData.location.trim() || "main",
+        etims_item_code: hasVariants ? undefined : formData.etims_item_code,
+        etims_item_class_code: formData.etims_item_class_code,
+        etims_product_type_code: formData.etims_product_type_code,
+        etims_origin_country_code: formData.etims_origin_country_code,
+        etims_packaging_unit_code: formData.etims_packaging_unit_code,
+        etims_quantity_unit_code: formData.etims_quantity_unit_code,
+        etims_tax_type_code: formData.etims_tax_type_code,
         warehouse_id: warehouseId || undefined,
       };
 
       if (hasVariants && generatedVariants.length > 0) {
         productData.variants = generatedVariants.map((v) => ({
           ...v,
-          unit_cost: parseFloat(v.unit_cost || "0"),
-          retail_price: parseFloat(v.retail_price || "0"),
+          unit_cost: centsToKesString(getPriceCents(v.unit_cost) ?? 0),
+          retail_price: centsToKesString(getPriceCents(v.retail_price) ?? 0),
           stock_on_hand: Number(v.stock_on_hand || "0"),
           barcode: v.barcode || v.sku,
+          etims_item_code: v.etims_item_code,
         }));
       }
 
@@ -535,9 +564,8 @@ export default function NewProduct() {
                 <Label htmlFor="retail_price">Base Retail Price (KSh) *</Label>
                 <Input
                   id="retail_price"
-                  type="number"
-                  step="0.01"
-                  min="0"
+                  type="text"
+                  inputMode="decimal"
                   required
                   value={formData.retail_price}
                   onChange={(e) =>
@@ -549,9 +577,8 @@ export default function NewProduct() {
                 <Label htmlFor="unit_cost">Base Unit Cost (KSh) *</Label>
                 <Input
                   id="unit_cost"
-                  type="number"
-                  step="0.01"
-                  min="0"
+                  type="text"
+                  inputMode="decimal"
                   required
                   value={formData.unit_cost}
                   onChange={(e) =>
@@ -559,6 +586,112 @@ export default function NewProduct() {
                   }
                 />
               </div>
+            </div>
+          </CardContent>
+        </Card>
+
+        <Card>
+          <CardHeader>
+            <CardTitle>KRA eTIMS Item Mapping</CardTitle>
+            <CardDescription>
+              Optional until an approved VSCU is configured. Enter the exact
+              item and code values assigned or confirmed for your business by
+              KRA; the POS does not infer tax, origin, packaging, or quantity
+              units. Each variant needs its own unique KRA item code below.
+            </CardDescription>
+          </CardHeader>
+          <CardContent className="grid grid-cols-1 md:grid-cols-2 gap-4">
+            {!hasVariants && (
+              <div className="space-y-2">
+                <Label htmlFor="etims_item_code">KRA Item Code</Label>
+                <Input
+                  id="etims_item_code"
+                  maxLength={20}
+                  value={formData.etims_item_code}
+                  onChange={(e) => setFormData({ ...formData, etims_item_code: e.target.value })}
+                />
+              </div>
+            )}
+            <div className="space-y-2">
+              <Label htmlFor="etims_item_class_code">KRA Item Classification Code</Label>
+              <Input
+                id="etims_item_class_code"
+                maxLength={10}
+                value={formData.etims_item_class_code}
+                onChange={(e) => setFormData({ ...formData, etims_item_class_code: e.target.value })}
+              />
+            </div>
+            <div className="space-y-2">
+              <Label htmlFor="etims_product_type_code">KRA Product Type</Label>
+              <Select
+                value={formData.etims_product_type_code || "none"}
+                onValueChange={(value) => setFormData({
+                  ...formData,
+                  etims_product_type_code: value === "none" ? "" : value,
+                })}
+              >
+                <SelectTrigger id="etims_product_type_code">
+                  <SelectValue placeholder="Select KRA product type" />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="none">Not mapped</SelectItem>
+                  <SelectItem value="1">1 - Raw material</SelectItem>
+                  <SelectItem value="2">2 - Finished product</SelectItem>
+                  <SelectItem value="3">3 - Service</SelectItem>
+                </SelectContent>
+              </Select>
+            </div>
+            <div className="space-y-2">
+              <Label htmlFor="etims_origin_country_code">KRA Country of Origin Code</Label>
+              <Input
+                id="etims_origin_country_code"
+                maxLength={5}
+                value={formData.etims_origin_country_code}
+                onChange={(e) => setFormData({ ...formData, etims_origin_country_code: e.target.value })}
+                placeholder="Enter the KRA country code"
+              />
+            </div>
+            <div className="space-y-2">
+              <Label htmlFor="etims_packaging_unit_code">KRA Packaging Unit Code</Label>
+              <Input
+                id="etims_packaging_unit_code"
+                maxLength={5}
+                value={formData.etims_packaging_unit_code}
+                onChange={(e) => setFormData({ ...formData, etims_packaging_unit_code: e.target.value })}
+                placeholder="Enter the KRA packaging code"
+              />
+            </div>
+            <div className="space-y-2">
+              <Label htmlFor="etims_quantity_unit_code">KRA Unit of Quantity Code</Label>
+              <Input
+                id="etims_quantity_unit_code"
+                maxLength={5}
+                value={formData.etims_quantity_unit_code}
+                onChange={(e) => setFormData({ ...formData, etims_quantity_unit_code: e.target.value })}
+                placeholder="Enter the KRA quantity code"
+              />
+            </div>
+            <div className="space-y-2">
+              <Label htmlFor="etims_tax_type_code">KRA Tax Type</Label>
+              <Select
+                value={formData.etims_tax_type_code || "none"}
+                onValueChange={(value) => setFormData({
+                  ...formData,
+                  etims_tax_type_code: value === "none" ? "" : value,
+                })}
+              >
+                <SelectTrigger id="etims_tax_type_code">
+                  <SelectValue placeholder="Select KRA tax type" />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="none">Not mapped</SelectItem>
+                  <SelectItem value="A">A - Exempt</SelectItem>
+                  <SelectItem value="B">B - 16%</SelectItem>
+                  <SelectItem value="C">C - Zero-rated</SelectItem>
+                  <SelectItem value="D">D - Non-VAT</SelectItem>
+                  <SelectItem value="E">E - 8%</SelectItem>
+                </SelectContent>
+              </Select>
             </div>
           </CardContent>
         </Card>
@@ -639,68 +772,54 @@ export default function NewProduct() {
                   </div>
                   <div className="divide-y max-h-[300px] overflow-y-auto">
                     {generatedVariants.map((v, i) => (
-                      <div
-                        key={i}
-                        className="grid grid-cols-12 p-2 gap-2 items-center"
-                      >
-                        <div className="col-span-3 text-sm">
-                          {Object.values(v.variant_attributes).join(" / ")}
+                      <div key={i} className="space-y-2 p-2">
+                        <div className="grid grid-cols-12 gap-2 items-center">
+                          <div className="col-span-3 text-sm">
+                            {Object.values(v.variant_attributes).join(" / ")}
+                          </div>
+                          <div className="col-span-3">
+                            <Input
+                              className="h-8"
+                              value={v.sku}
+                              onChange={(e) => handleVariantChange(i, "sku", e.target.value)}
+                            />
+                          </div>
+                          <div className="col-span-2">
+                            <Input
+                              className="h-8"
+                              type="text"
+                              inputMode="decimal"
+                              value={v.retail_price}
+                              onChange={(e) => handleVariantChange(i, "retail_price", e.target.value)}
+                            />
+                          </div>
+                          <div className="col-span-2">
+                            <Input
+                              className="h-8"
+                              type="text"
+                              inputMode="decimal"
+                              value={v.unit_cost}
+                              onChange={(e) => handleVariantChange(i, "unit_cost", e.target.value)}
+                            />
+                          </div>
+                          <div className="col-span-2">
+                            <Input
+                              className="h-8"
+                              type="number"
+                              min="0"
+                              step="1"
+                              value={v.stock_on_hand}
+                              onChange={(e) => handleVariantChange(i, "stock_on_hand", e.target.value)}
+                            />
+                          </div>
                         </div>
-                        <div className="col-span-3">
+                        <div className="space-y-1">
+                          <Label htmlFor={`etims_item_code_${i}`}>KRA Item Code</Label>
                           <Input
-                            className="h-8"
-                            value={v.sku}
-                            onChange={(e) =>
-                              handleVariantChange(i, "sku", e.target.value)
-                            }
-                          />
-                        </div>
-                        <div className="col-span-2">
-                          <Input
-                            className="h-8"
-                            type="number"
-                            min="0"
-                            step="0.01"
-                            value={v.retail_price}
-                            onChange={(e) =>
-                              handleVariantChange(
-                                i,
-                                "retail_price",
-                                e.target.value,
-                              )
-                            }
-                          />
-                        </div>
-                        <div className="col-span-2">
-                          <Input
-                            className="h-8"
-                            type="number"
-                            min="0"
-                            step="0.01"
-                            value={v.unit_cost}
-                            onChange={(e) =>
-                              handleVariantChange(
-                                i,
-                                "unit_cost",
-                                e.target.value,
-                              )
-                            }
-                          />
-                        </div>
-                        <div className="col-span-2">
-                          <Input
-                            className="h-8"
-                            type="number"
-                            min="0"
-                            step="1"
-                            value={v.stock_on_hand}
-                            onChange={(e) =>
-                              handleVariantChange(
-                                i,
-                                "stock_on_hand",
-                                e.target.value,
-                              )
-                            }
+                            id={`etims_item_code_${i}`}
+                            maxLength={20}
+                            value={v.etims_item_code}
+                            onChange={(e) => handleVariantChange(i, "etims_item_code", e.target.value)}
                           />
                         </div>
                       </div>
